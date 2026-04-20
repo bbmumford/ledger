@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+option go_package = "github.com/bbmumford/ledger/pb";
+
+// LADRecord is the wire format for directory records in gossip exchanges.
+// Each consumer defines its own record structure. HSTLES/ORBTR uses this
+// for member, role, reach, and latency records. Hospitium defines CRDT
+// record protos separately.
+message LADRecord {
+    string topic = 1;
+    string node_id = 2;
+    string tenant_id = 3;
+    bytes body = 4;
+    int64 timestamp_unix = 5;
+    uint64 lamport_clock = 6;
+    uint64 seq = 7;
+    bool tombstone = 8;
+    int64 deleted_at_unix = 9;
+    string tombstone_reason = 10;
+    bytes signature = 11;
+    uint64 hlc_timestamp = 12;
+    bytes author_pubkey = 13;
+    string blob_cid = 14;
+    int64 expires_at_unix = 15;
+}
