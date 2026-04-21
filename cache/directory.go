@@ -71,6 +71,16 @@ type DirectoryCache struct {
 	mu    sync.RWMutex
 	store CacheStore
 
+	// localNodeID identifies the record owner that this cache runs on.
+	// When set (via SetLocalNodeID), EvictExpired skips removal of
+	// records whose NodeID matches — so a live node can never evict
+	// its OWN member/role/reach entries and emit a self-referential
+	// tombstone that later suppresses its own re-announcement. Empty
+	// string disables the exemption (backward compatible for tests
+	// and consumers that don't set it). Set-once at startup, then
+	// read lock-free under c.mu's existing read paths in eviction.
+	localNodeID string
+
 	// Legacy map fields — kept for backward compatibility with tests that access
 	// them directly. When using the default MemoryCacheStore, these point to the
 	// store's internal maps. For custom CacheStore implementations these are nil.
@@ -159,6 +169,31 @@ func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.metrics = m
+}
+
+// SetLocalNodeID identifies which NodeID is "self" so eviction never
+// removes the local node's own records. Empty string disables the
+// exemption. Intended for set-once use at startup; safe to call at
+// any time but eviction that has already run with a different value
+// can't be undone.
+//
+// Without this guard, a node whose self-announcement has lapsed past
+// GossipLivenessTimeout can evict its OWN member/role entries and emit
+// a tombstone that propagates, suppressing later re-announcements and
+// turning the node invisible to the rest of the mesh (the exact
+// symptom behind 94-tombstones-vs-2-members).
+func (c *DirectoryCache) SetLocalNodeID(nodeID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localNodeID = nodeID
+}
+
+// LocalNodeID returns the currently-registered local node identifier
+// (empty if unset).
+func (c *DirectoryCache) LocalNodeID() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.localNodeID
 }
 
 // Subscribe registers a callback for record changes on a topic.
@@ -574,9 +609,22 @@ func (c *DirectoryCache) EvictExpired() int {
 	gossipCutoff := now.Add(-GossipLivenessTimeout)
 
 	// --- Evict member records by gossip liveness ---
+	//
+	// Self-exemption: a node must never evict its OWN member record.
+	// Doing so creates a self-referential "liveness" tombstone that
+	// propagates via gossip and suppresses the node's own future
+	// re-announcements (tombstone wins on causal compare). Before this
+	// guard, any node that went 16 minutes without re-publishing
+	// (e.g. quiet service hours) would self-tombstone and vanish from
+	// its peers' member directories even while its peer connections
+	// stayed healthy — the mechanism behind the 94-tombstones-vs-2-
+	// members symptom on help.orbtr.io after fleet-wide deploys.
 	allMembers := c.store.AllMembers()
 	for tenant, members := range allMembers {
 		for _, rec := range members {
+			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
+				continue
+			}
 			lastSeen, _ := c.store.GetGossipSeen(rec.NodeID)
 			if lastSeen.IsZero() {
 				lastSeen = rec.CreatedAt
@@ -594,6 +642,8 @@ func (c *DirectoryCache) EvictExpired() int {
 	}
 
 	// --- Enforce per-tenant cap on member records ---
+	// Self is also exempt from cap eviction for the same reason:
+	// a capacity-tombstone on self suppresses future self-announces.
 	allMembers = c.store.AllMembers()
 	for tenant, members := range allMembers {
 		if len(members) > maxRecordsPerTenant {
@@ -603,12 +653,21 @@ func (c *DirectoryCache) EvictExpired() int {
 			}
 			entries := make([]memberEntry, 0, len(members))
 			for _, m := range members {
+				if c.localNodeID != "" && m.NodeID == c.localNodeID {
+					continue
+				}
 				entries = append(entries, memberEntry{m.NodeID, m.CreatedAt})
 			}
 			sort.Slice(entries, func(i, j int) bool {
 				return entries[i].createdAt.Before(entries[j].createdAt)
 			})
-			excess := len(members) - maxRecordsPerTenant
+			// Recompute excess against the (possibly smaller) non-self set.
+			nonSelf := len(entries)
+			overCap := len(members) - maxRecordsPerTenant
+			excess := overCap
+			if excess > nonSelf {
+				excess = nonSelf
+			}
 			for i := 0; i < excess; i++ {
 				c.emitTombstone(lad.TopicMember, tenant, entries[i].nodeID, "cap")
 				c.store.DeleteMember(tenant, entries[i].nodeID)
@@ -618,9 +677,15 @@ func (c *DirectoryCache) EvictExpired() int {
 	}
 
 	// --- Evict reach records by ExpiresAt or gossip liveness ---
+	// Same self-exemption as members: never tombstone the local node's
+	// own reach record, or a stale local entry vanishes from its peers
+	// and can't be revived by future self-announcements.
 	allReach := c.store.AllReach()
 	for tenant, records := range allReach {
 		for _, rec := range records {
+			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
+				continue
+			}
 			if !rec.ExpiresAt.IsZero() {
 				if rec.ExpiresAt.Before(now) {
 					c.emitTombstone(lad.TopicReach, tenant, rec.NodeID, "liveness")
@@ -651,12 +716,20 @@ func (c *DirectoryCache) EvictExpired() int {
 			}
 			entries := make([]reachEntry, 0, len(records))
 			for _, r := range records {
+				if c.localNodeID != "" && r.NodeID == c.localNodeID {
+					continue
+				}
 				entries = append(entries, reachEntry{r.NodeID, r.UpdatedAt})
 			}
 			sort.Slice(entries, func(i, j int) bool {
 				return entries[i].updatedAt.Before(entries[j].updatedAt)
 			})
-			excess := len(records) - maxRecordsPerTenant
+			nonSelf := len(entries)
+			overCap := len(records) - maxRecordsPerTenant
+			excess := overCap
+			if excess > nonSelf {
+				excess = nonSelf
+			}
 			for i := 0; i < excess; i++ {
 				c.emitTombstone(lad.TopicReach, tenant, entries[i].nodeID, "cap")
 				c.store.DeleteReach(tenant, entries[i].nodeID)
