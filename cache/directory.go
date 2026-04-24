@@ -885,6 +885,15 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 		if err != nil {
 			return err
 		}
+		// Reach-layer deltas (address-change ops) ride the same topic as
+		// full snapshots but carry none of the signed identity payload
+		// (Metadata, Addresses, Region etc.). Storing them would clobber
+		// the last full snapshot — skip instead. The publisher re-emits
+		// a full snapshot on a cadence and on every Epoch/Bootstrap, so
+		// the cache converges to fresh state without us applying deltas.
+		if reach.IsReachDelta() {
+			return nil
+		}
 		reach.UpdatedAt = rec.Timestamp
 		reach.Seq = rec.Seq
 		c.mu.RLock()
