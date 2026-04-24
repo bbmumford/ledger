@@ -120,6 +120,39 @@ type DirectoryCache struct {
 	indexFuncs  map[lad.Topic]map[string]lad.IndexFunc  // topic -> indexName -> func
 	indexes     map[lad.Topic]map[string]map[string][]lad.Record // topic -> indexName -> key -> records
 	compaction  map[lad.Topic]lad.CompactionPolicy
+
+	// reachDeltaApplier reconstructs a full ReachRecord body from the
+	// previous full-snapshot body + a delta body. Consumers (the reach
+	// package) register one via SetReachDeltaApplier; without it,
+	// reach-layer deltas are skipped and the cache waits for the next
+	// full snapshot to refresh. See ReachDeltaApplier docs.
+	reachDeltaApplier ReachDeltaApplier
+	// lastReachBody keeps the most recent full-snapshot body per
+	// (tenant, nodeID) so the delta applier has a base to rebuild from.
+	// Updated on every full-snapshot apply and on every successful delta
+	// reconstruction. Parallel to store.Reach, not a replacement.
+	lastReachBody map[string]map[string][]byte
+}
+
+// ReachDeltaApplier reconstructs a full ReachRecord body from the previous
+// full-snapshot body and a reach-layer delta body. The returned body MUST
+// be a valid full ReachRecord JSON (SchemaVersion without the delta flag),
+// with the delta's ops applied to the base's address set, the delta's
+// UpdatedAt/HLC, and the base's Metadata/Region/Signature preserved as
+// appropriate. Implementations typically live in the reach package so they
+// can manipulate the full reach.Address shape; the cache treats bodies as
+// opaque.
+//
+// When nil (the default), the cache skips delta bodies entirely and lets
+// the next full-snapshot publish refresh the cache state.
+type ReachDeltaApplier func(baseBody, deltaBody []byte) (newBody []byte, err error)
+
+// SetReachDeltaApplier installs (or clears) the delta applier. Safe to call
+// at any time; the next delta apply uses the new applier.
+func (c *DirectoryCache) SetReachDeltaApplier(a ReachDeltaApplier) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reachDeltaApplier = a
 }
 
 // RegisterMerge sets the merge function for a topic.
@@ -881,26 +914,55 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 		isNew = !exists
 		c.storeRole(role)
 	case lad.TopicReach:
-		reach, err := lad.UnmarshalReach(rec.Body)
+		peek, err := lad.UnmarshalReach(rec.Body)
 		if err != nil {
 			return err
 		}
-		// Reach-layer deltas (address-change ops) ride the same topic as
-		// full snapshots but carry none of the signed identity payload
-		// (Metadata, Addresses, Region etc.). Storing them would clobber
-		// the last full snapshot — skip instead. The publisher re-emits
-		// a full snapshot on a cadence and on every Epoch/Bootstrap, so
-		// the cache converges to fresh state without us applying deltas.
-		if reach.IsReachDelta() {
-			return nil
+		if peek.IsReachDelta() {
+			// Reach-layer delta: compact address-change ops. The delta body
+			// carries no signed identity payload (Metadata/Region/...), so
+			// it can't be stored directly. If a ReachDeltaApplier is
+			// registered AND we hold a base full snapshot, rebuild a full
+			// record from (base + ops) and store that. Otherwise skip and
+			// wait for the next full snapshot to refresh.
+			c.mu.RLock()
+			applier := c.reachDeltaApplier
+			var baseBody []byte
+			if tenantMap, ok := c.lastReachBody[peek.TenantID]; ok {
+				baseBody = tenantMap[peek.NodeID]
+			}
+			_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
+			c.mu.RUnlock()
+			if applier == nil || baseBody == nil {
+				return nil
+			}
+			newBody, err := applier(baseBody, rec.Body)
+			if err != nil {
+				return nil // skip on reconstruction error; base remains authoritative
+			}
+			rebuilt, err := lad.UnmarshalReach(newBody)
+			if err != nil {
+				return nil
+			}
+			if rebuilt.IsReachDelta() {
+				return nil // applier returned another delta — malformed
+			}
+			rebuilt.UpdatedAt = rec.Timestamp
+			rebuilt.Seq = rec.Seq
+			isNew = !exists
+			c.storeReach(rebuilt)
+			c.setLastReachBody(rebuilt.TenantID, rebuilt.NodeID, newBody)
+			break
 		}
-		reach.UpdatedAt = rec.Timestamp
-		reach.Seq = rec.Seq
+		// Full snapshot path.
+		peek.UpdatedAt = rec.Timestamp
+		peek.Seq = rec.Seq
 		c.mu.RLock()
-		_, exists := c.store.GetReach(reach.TenantID, reach.NodeID)
+		_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
 		c.mu.RUnlock()
 		isNew = !exists
-		c.storeReach(reach)
+		c.storeReach(peek)
+		c.setLastReachBody(peek.TenantID, peek.NodeID, rec.Body)
 	case lad.TopicLatency:
 		lat, err := lad.UnmarshalLatency(rec.Body)
 		if err != nil {
@@ -1061,6 +1123,29 @@ func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.store.PutRole(role.TenantID, role)
+}
+
+// setLastReachBody stores the raw body of the most recent full-snapshot
+// ReachRecord for (tenant, nodeID) so delta applies have a base to rebuild
+// from. Caller must not hold c.mu.
+func (c *DirectoryCache) setLastReachBody(tenant, nodeID string, body []byte) {
+	if len(body) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastReachBody == nil {
+		c.lastReachBody = make(map[string]map[string][]byte)
+	}
+	tm, ok := c.lastReachBody[tenant]
+	if !ok {
+		tm = make(map[string][]byte)
+		c.lastReachBody[tenant] = tm
+	}
+	// Copy so we don't retain a caller-controlled buffer.
+	dup := make([]byte, len(body))
+	copy(dup, body)
+	tm[nodeID] = dup
 }
 
 func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
