@@ -1125,6 +1125,28 @@ func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
 	c.store.PutRole(role.TenantID, role)
 }
 
+// GetLastReachBody returns a copy of the most recent full-snapshot body
+// for (tenant, nodeID), or nil if none is cached. Exposed so the reach
+// package's FreshnessClient can compute the cached address-set digest
+// and decide whether to ignore or act on an incoming announce.
+//
+// The returned slice is a private copy; callers may mutate it freely.
+func (c *DirectoryCache) GetLastReachBody(tenant, nodeID string) []byte {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	tm, ok := c.lastReachBody[tenant]
+	if !ok {
+		return nil
+	}
+	body, ok := tm[nodeID]
+	if !ok {
+		return nil
+	}
+	dup := make([]byte, len(body))
+	copy(dup, body)
+	return dup
+}
+
 // setLastReachBody stores the raw body of the most recent full-snapshot
 // ReachRecord for (tenant, nodeID) so delta applies have a base to rebuild
 // from. Caller must not hold c.mu.
