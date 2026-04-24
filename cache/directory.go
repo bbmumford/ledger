@@ -1076,13 +1076,53 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 }
 
 // Members returns the registered members for a tenant.
+//
+// The cache unifies two sources into a single view:
+//   - Persisted MemberRecord entries (explicit Append of TopicMember)
+//   - Derived views synthesised from ReachRecord.Metadata
+//
+// A ReachRecord whose Metadata map is non-empty contributes a MemberRecord
+// view keyed by NodeID: Attrs mirror Metadata verbatim, CreatedAt is the
+// reach UpdatedAt, and ExpiresAt is the reach ExpiresAt. This ties the
+// synthetic Member's lifetime to the signed Reach record, so TTL eviction
+// cannot cause the Member view to decay independently of the reachability
+// data that produced it.
+//
+// Persisted Members shadow derived ones — consumers that explicitly append
+// a MemberRecord (e.g. agents storing peer-info) keep full control. Nodes
+// that only publish Reach get a Member view for free, with no separate
+// publish path and no TTL drift.
 func (c *DirectoryCache) Members(ctx context.Context, tenant string) ([]lad.MemberRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	result := c.store.ListMembers(tenant)
+	persisted := c.store.ListMembers(tenant)
+	seen := make(map[string]struct{}, len(persisted))
+	for _, m := range persisted {
+		seen[m.NodeID] = struct{}{}
+	}
+	result := persisted
+	for _, reach := range c.store.ListReach(tenant) {
+		if _, ok := seen[reach.NodeID]; ok {
+			continue
+		}
+		if len(reach.Metadata) == 0 {
+			continue
+		}
+		attrs := make(map[string]string, len(reach.Metadata))
+		for k, v := range reach.Metadata {
+			attrs[k] = v
+		}
+		result = append(result, lad.MemberRecord{
+			TenantID:  reach.TenantID,
+			NodeID:    reach.NodeID,
+			CreatedAt: reach.UpdatedAt,
+			ExpiresAt: reach.ExpiresAt,
+			Attrs:     attrs,
+		})
+	}
 	sort.Slice(result, func(i, j int) bool { return result[i].NodeID < result[j].NodeID })
 	return result, nil
 }
