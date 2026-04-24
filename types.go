@@ -186,6 +186,14 @@ type ReachRecord struct {
 	ExpiresAt     time.Time      `json:"expires_at"`
 	UpdatedAt     time.Time      `json:"ts"`
 
+	// SchemaVersion lets the cache detect delta-encoded bodies (bit 15
+	// set) and skip applying them — deltas are an address-change
+	// optimisation at the reach layer and would otherwise clobber the
+	// last signed full snapshot (wiping Metadata/Addresses/Region).
+	// Full snapshots are re-emitted on a cadence, so Metadata stays
+	// fresh regardless.
+	SchemaVersion uint16 `json:"v,omitempty"`
+
 	// Metadata is consumer-defined identity payload carried alongside
 	// reachability. Examples: {"service_name":"devices.orbtr.io",
 	// "roles":"anchor","region":"iad","fly_machine":"abc"} for mesh
@@ -195,6 +203,15 @@ type ReachRecord struct {
 	// a parallel Member publish path — a single signed ReachRecord is
 	// the source of truth for both "how to reach me" and "who I am".
 	Metadata map[string]string `json:"meta,omitempty"`
+}
+
+// ReachDeltaSchemaFlag marks a ReachRecord body as a reach-layer delta
+// (address ops) rather than a full snapshot. Matches reach.DeltaSchemaFlag.
+const ReachDeltaSchemaFlag uint16 = 0x8000
+
+// IsReachDelta reports whether the body behind a ReachRecord is a delta.
+func (r ReachRecord) IsReachDelta() bool {
+	return r.SchemaVersion&ReachDeltaSchemaFlag != 0
 }
 
 // LatencyDuration exposes the latency as a time.Duration for callers.
