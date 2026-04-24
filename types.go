@@ -185,6 +185,16 @@ type ReachRecord struct {
 	LoadFactor    float64        `json:"load_factor"` // 0.0 (idle) to 1.0 (overloaded)
 	ExpiresAt     time.Time      `json:"expires_at"`
 	UpdatedAt     time.Time      `json:"ts"`
+
+	// Metadata is consumer-defined identity payload carried alongside
+	// reachability. Examples: {"service_name":"devices.orbtr.io",
+	// "roles":"anchor","region":"iad","fly_machine":"abc"} for mesh
+	// nodes, or {"hostname":"alice-laptop","device_id":"dev-abc"} for
+	// agents. The ledger cache derives MemberRecord views from this
+	// map on read (see DirectoryCache.Members), so consumers don't need
+	// a parallel Member publish path — a single signed ReachRecord is
+	// the source of truth for both "how to reach me" and "who I am".
+	Metadata map[string]string `json:"meta,omitempty"`
 }
 
 // LatencyDuration exposes the latency as a time.Duration for callers.
