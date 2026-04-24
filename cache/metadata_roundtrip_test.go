@@ -55,11 +55,91 @@ func TestReachRecord_MetadataRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCache_SkipsReachDelta verifies that a reach-layer delta body
-// (SchemaVersion with bit 15 set) does NOT clobber the previously
-// stored full snapshot. Deltas carry no Metadata / Addresses / Region,
-// so applying them as ReachRecord overwrites would wipe the signed
-// identity payload. The cache must skip them.
+// TestCache_DeltaApplierRebuildsFullRecord verifies that when a
+// ReachDeltaApplier is registered, the cache rebuilds the full
+// ReachRecord from (stored base body + incoming delta body). Metadata
+// must survive; addresses reflect the delta ops.
+func TestCache_DeltaApplierRebuildsFullRecord(t *testing.T) {
+	c := NewDirectoryCache()
+
+	// Applier: ignores the delta body contents and just returns a synthesized
+	// full record with the base's NodeID + Metadata + a new Address.
+	c.SetReachDeltaApplier(func(baseBody, deltaBody []byte) ([]byte, error) {
+		var base lad.ReachRecord
+		if err := json.Unmarshal(baseBody, &base); err != nil {
+			return nil, err
+		}
+		// Pretend the delta added one address.
+		base.Addresses = append(base.Addresses, lad.ReachAddress{
+			Host: "1.2.3.4", Port: 8080, Proto: "udp", Scope: "public",
+		})
+		base.SchemaVersion = 1 // full, not delta
+		return json.Marshal(&base)
+	})
+
+	// Seed full snapshot.
+	full := lad.ReachRecord{
+		TenantID:  "",
+		NodeID:    "vl1_alice",
+		Region:    "iad",
+		UpdatedAt: time.Now(),
+		Addresses: []lad.ReachAddress{{Host: "5.6.7.8", Port: 9000, Proto: "udp", Scope: "public"}},
+		Metadata: map[string]string{
+			"service_name": "alice.example.com",
+			"region":       "iad",
+		},
+	}
+	fullBody, _ := json.Marshal(full)
+	if err := c.Apply(lad.Record{
+		Topic:     lad.TopicReach,
+		NodeID:    "vl1_alice",
+		Body:      fullBody,
+		Seq:       1,
+		Timestamp: time.Now(),
+	}); err != nil {
+		t.Fatalf("apply full: %v", err)
+	}
+
+	// Send a delta (body shape irrelevant — applier rewrites).
+	deltaBody := []byte(`{"node_id":"vl1_alice","tenant":"","v":32769,"ops":[]}`)
+	if err := c.Apply(lad.Record{
+		Topic:     lad.TopicReach,
+		NodeID:    "vl1_alice",
+		Body:      deltaBody,
+		Seq:       2,
+		Timestamp: time.Now().Add(time.Second),
+	}); err != nil {
+		t.Fatalf("apply delta: %v", err)
+	}
+
+	reaches, _ := c.Reach(context.Background(), "", ReachQuery{})
+	if len(reaches) != 1 {
+		t.Fatalf("expected 1 reach, got %d", len(reaches))
+	}
+	got := reaches[0]
+	if got.Metadata["service_name"] != "alice.example.com" {
+		t.Fatalf("metadata lost: %+v", got.Metadata)
+	}
+	if len(got.Addresses) != 2 {
+		t.Fatalf("expected 2 addresses after delta, got %d", len(got.Addresses))
+	}
+	foundNewAddr := false
+	for _, a := range got.Addresses {
+		if a.Host == "1.2.3.4" && a.Port == 8080 {
+			foundNewAddr = true
+		}
+	}
+	if !foundNewAddr {
+		t.Fatalf("delta applier's new address not present: %+v", got.Addresses)
+	}
+	// Seq should be from the delta envelope.
+	if got.Seq != 2 {
+		t.Fatalf("expected Seq=2 from delta envelope, got %d", got.Seq)
+	}
+}
+
+// TestCache_DeltaWithoutApplierSkips verifies the fallback behavior: no
+// applier + delta → skip, full record untouched.
 func TestCache_SkipsReachDelta(t *testing.T) {
 	c := NewDirectoryCache()
 
