@@ -132,6 +132,20 @@ type DirectoryCache struct {
 	// Updated on every full-snapshot apply and on every successful delta
 	// reconstruction. Parallel to store.Reach, not a replacement.
 	lastReachBody map[string]map[string][]byte
+
+	// identityViews is the per-(NodeID, Topic) projection used by the
+	// reconciliation driver as the canonical IBLT input. Each entry
+	// reflects the most recent record's content hash + HLC + last
+	// update time, so two nodes computing IBLTs over their respective
+	// projections see identical cells when their caches are in sync —
+	// even if the topic-keyed merge merged a Reach delta into a base
+	// body that was originally a different record's content.
+	//
+	// Cache-only — never serialised to the wire. Refreshed on every
+	// successful Apply, including merges. Tombstones remove the entry.
+	//
+	// Map shape: identityViews[nodeID][topic] → IdentityView.
+	identityViews map[string]map[string]lad.IdentityView
 }
 
 // ReachDeltaApplier reconstructs a full ReachRecord body from the previous
@@ -461,7 +475,8 @@ func NewDirectoryCache(stores ...CacheStore) *DirectoryCache {
 	}
 
 	dc := &DirectoryCache{
-		store: store,
+		store:         store,
+		identityViews: make(map[string]map[string]lad.IdentityView),
 	}
 
 	// Wire up legacy map fields for backward compatibility when using MemoryCacheStore.
@@ -844,6 +859,10 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 	// Phase 3: Handle tombstone records — delete matching cache entries
 	if rec.Tombstone {
 		c.applyTombstone(rec)
+		// Drop the projection entry too — peers reconciling on the
+		// IBLT need to see the tombstone as a key removal, not as
+		// "still present with old content."
+		c.updateIdentityView(rec)
 		// Fire membership change callback for member tombstones (hypercube rebuild)
 		if rec.Topic == lad.TopicMember && c.OnMembershipChange != nil {
 			c.OnMembershipChange()
@@ -1010,6 +1029,12 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 			c.mu.Unlock()
 		}
 	}
+
+	// Update the per-(NodeID, Topic) projection so the reconciliation
+	// driver's IBLT input stays in lockstep with what the cache
+	// considers authoritative. Skipped when the record was rejected
+	// upstream (we'd have returned already) or topic is unknown.
+	c.updateIdentityView(rec)
 
 	// Fire callbacks AFTER lock is released (storeX methods release their locks)
 	if isNew && c.OnNewRecord != nil {
@@ -1924,4 +1949,76 @@ func (c *DirectoryCache) SubscribeWithReplay(topic lad.Topic, since uint64, hand
 
 	// Register live subscriber.
 	c.Subscribe(topic, handler)
+}
+
+// updateIdentityView refreshes the per-(NodeID, Topic) projection
+// entry for a record that just merged successfully. Tombstones drop
+// the entry. Records with empty NodeID (e.g. quorum singletons) are
+// skipped — the projection is identity-keyed and only meaningful for
+// per-node records.
+//
+// The projection's content hash is the canonical input to the G4
+// reconciliation IBLT — by deriving the hash from the merged record
+// (not the wire form), two nodes that merged a delta into the same
+// base body see the same hash, even though the wire bytes differed.
+func (c *DirectoryCache) updateIdentityView(rec lad.Record) {
+	if rec.NodeID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.identityViews == nil {
+		c.identityViews = make(map[string]map[string]lad.IdentityView)
+	}
+	topic := string(rec.Topic)
+	if rec.Tombstone {
+		if topicMap, ok := c.identityViews[rec.NodeID]; ok {
+			delete(topicMap, topic)
+			if len(topicMap) == 0 {
+				delete(c.identityViews, rec.NodeID)
+			}
+		}
+		return
+	}
+	if _, ok := c.identityViews[rec.NodeID]; !ok {
+		c.identityViews[rec.NodeID] = make(map[string]lad.IdentityView)
+	}
+	c.identityViews[rec.NodeID][topic] = lad.IdentityView{
+		NodeID:      rec.NodeID,
+		Topic:       topic,
+		ContentHash: rec.ContentHash(),
+		HLC:         rec.HLCTimestamp,
+		UpdatedAt:   time.Now().UnixNano(),
+	}
+}
+
+// IdentityViews returns a snapshot of every (NodeID, Topic) entry in
+// the projection. Used by reconciliation drivers as the canonical
+// IBLT input. Order is unstable; callers that need a stable order
+// (the IBLT driver, for instance) should sort by content hash.
+func (c *DirectoryCache) IdentityViews() []lad.IdentityView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.identityViews) == 0 {
+		return nil
+	}
+	out := make([]lad.IdentityView, 0, len(c.identityViews)*2)
+	for _, topicMap := range c.identityViews {
+		for _, v := range topicMap {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// IdentityView returns the projection entry for a specific
+// (NodeID, Topic) pair, or zero-value + false if absent.
+func (c *DirectoryCache) IdentityView(nodeID, topic string) (lad.IdentityView, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if topicMap, ok := c.identityViews[nodeID]; ok {
+		v, found := topicMap[topic]
+		return v, found
+	}
+	return lad.IdentityView{}, false
 }
