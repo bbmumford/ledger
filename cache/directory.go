@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -684,7 +685,10 @@ func (c *DirectoryCache) EvictExpired() int {
 				removedMembers++
 				// Proactively evict latency records involving this dead node
 				// instead of waiting for their 10-minute TTL to expire.
-				removedLatency += c.evictLatencyForNode(rec.NodeID)
+				latencyHit := c.evictLatencyForNode(rec.NodeID)
+				removedLatency += latencyHit
+				log.Printf("[LIVENESS-EVICT] tenant=%s node=%s lastSeen=%s ageSec=%d latencyEvicted=%d gossipCutoff=%s",
+					tenant, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, gossipCutoff.UTC().Format(time.RFC3339))
 			}
 		}
 	}
