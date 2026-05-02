@@ -82,6 +82,31 @@ type DirectoryCache struct {
 	// read lock-free under c.mu's existing read paths in eviction.
 	localNodeID string
 
+	// gossipLivenessOverrides records nodeIDs whose member/reach
+	// records must NOT be evicted by liveness-timeout regardless of
+	// the cached lastGossipAt timestamp. The owning runtime maintains
+	// the override based on actual mesh-session state — set true when
+	// the connection manager registers a live session for the peer,
+	// cleared when the session is torn down. Without this, a peer
+	// that gossips on a transport whose RecordGossipSeen path runs
+	// late (or whose gossip exchanges are routed through a relay so
+	// the local cache never directly observes inbound traffic from
+	// that peer) gets liveness-evicted at the 16-minute mark even
+	// though the mesh-session layer treats it as fully connected.
+	// The eviction emits a tombstone, the tombstone wins on causal
+	// compare against future re-publishes from the same peer, and the
+	// peer becomes effectively invisible to this cache until process
+	// restart — the exact "(unresolved)" topology pattern observed
+	// across the fleet at v0.0.218 where the unresolved set rotates
+	// among connected peers as their gossip-seen timestamps drift past
+	// the threshold.
+	//
+	// Map presence == override active; the boolean value is reserved
+	// for future use (e.g. a "definitely dead, evict eagerly" mode).
+	// Lock discipline: read+write under c.mu, same as every other
+	// map on this struct.
+	gossipLivenessOverrides map[string]bool
+
 	// Legacy map fields — kept for backward compatibility with tests that access
 	// them directly. When using the default MemoryCacheStore, these point to the
 	// store's internal maps. For custom CacheStore implementations these are nil.
@@ -508,6 +533,53 @@ func (c *DirectoryCache) RecordGossipSeen(nodeID string) {
 	c.mu.Unlock()
 }
 
+// SetGossipLivenessOverride installs (alive=true) or clears
+// (alive=false) an authoritative liveness override for nodeID. While
+// the override is set to true, EvictExpired's liveness-cutoff path
+// will skip evicting member, role, and reach records whose NodeID
+// matches — independent of the cached lastGossipAt freshness.
+//
+// Designed to be called by the owning runtime's connection manager:
+//
+//   - SetGossipLivenessOverride(peerNodeID, true) on the
+//     AcceptMeshConnection path once a session is registered in the
+//     dispatch registry,
+//   - SetGossipLivenessOverride(peerNodeID, false) on the
+//     session-cleanup path when the last live transport for that peer
+//     drops (allowing normal liveness-timeout eviction to take over
+//     for genuinely-departed peers).
+//
+// When alive=false the entry is removed from the override map rather
+// than stored as false; this keeps the absent==no-override invariant
+// so consumers that only know the local-node POV can answer
+// "should I evict?" with a single map presence check.
+func (c *DirectoryCache) SetGossipLivenessOverride(nodeID string, alive bool) {
+	if nodeID == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if alive {
+		if c.gossipLivenessOverrides == nil {
+			c.gossipLivenessOverrides = make(map[string]bool)
+		}
+		c.gossipLivenessOverrides[nodeID] = true
+		return
+	}
+	if c.gossipLivenessOverrides != nil {
+		delete(c.gossipLivenessOverrides, nodeID)
+	}
+}
+
+// hasLivenessOverride is the read-side companion to
+// SetGossipLivenessOverride. Caller must hold c.mu.
+func (c *DirectoryCache) hasLivenessOverride(nodeID string) bool {
+	if c.gossipLivenessOverrides == nil {
+		return false
+	}
+	return c.gossipLivenessOverrides[nodeID]
+}
+
 // LastGossipSeen returns when a nodeID was last seen in gossip (zero if never).
 func (c *DirectoryCache) LastGossipSeen(nodeID string) time.Time {
 	c.mu.RLock()
@@ -674,6 +746,20 @@ func (c *DirectoryCache) EvictExpired() int {
 			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
 				continue
 			}
+			// Authoritative liveness override from the runtime.
+			// When the connection manager has a live mesh session for
+			// this peer, skip the gossip-cutoff eviction even if
+			// lastGossipAt has drifted past the threshold (e.g.
+			// because gossip is flowing on a transport whose
+			// RecordGossipSeen path runs late, or because the peer
+			// gossips with us via an indirect path that doesn't touch
+			// our cache directly). Avoids the tombstone-suppress loop
+			// where a still-connected peer is liveness-evicted, the
+			// tombstone propagates back to the peer, and the peer's
+			// own re-publishes lose to the tombstone on causal compare.
+			if c.hasLivenessOverride(rec.NodeID) {
+				continue
+			}
 			lastSeen, _ := c.store.GetGossipSeen(rec.NodeID)
 			if lastSeen.IsZero() {
 				lastSeen = rec.CreatedAt
@@ -736,6 +822,18 @@ func (c *DirectoryCache) EvictExpired() int {
 	for tenant, records := range allReach {
 		for _, rec := range records {
 			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
+				continue
+			}
+			// Same authoritative liveness override as for member
+			// records: a peer with a live mesh session must not have
+			// its reach record liveness-evicted, regardless of how
+			// stale lastGossipAt happens to look from this cache's
+			// POV. The (unresolved) topology pattern observed in
+			// production was driven by reach eviction here, not member
+			// eviction — peers stayed in topology lists (member
+			// records survived) but lost their address resolution
+			// (reach records evicted).
+			if c.hasLivenessOverride(rec.NodeID) {
 				continue
 			}
 			if !rec.ExpiresAt.IsZero() {
