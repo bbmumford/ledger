@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lad "github.com/bbmumford/ledger"
@@ -117,7 +118,13 @@ type DirectoryCache struct {
 	lastGossipAt map[string]time.Time
 	tombstones   map[string]lad.Record
 
-	lamportClock uint64 // Phase G3: local Lamport timestamp, incremented on every operation
+	// lamportClock — local Lamport timestamp. Atomic so the
+	// max-then-increment dance on every Apply call does not require
+	// c.mu, which would block every concurrent reader (cache.Roles,
+	// cache.Members, cache.Reach) on the cache write lock for the
+	// duration of an Ed25519 signature verify in the ACL hook. The
+	// updateLamport helper is the only writer.
+	lamportClock atomic.Uint64
 
 	// Eviction lifecycle
 	evictStop chan struct{}
@@ -998,13 +1005,7 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 }
 
 func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
-	// Phase G3: Update Lamport clock — max(local, received) + 1
-	c.mu.Lock()
-	if rec.LamportClock > c.lamportClock {
-		c.lamportClock = rec.LamportClock
-	}
-	c.lamportClock++
-	c.mu.Unlock()
+	c.updateLamport(rec.LamportClock)
 
 	// Phase 3: Handle tombstone records — delete matching cache entries
 	if rec.Tombstone {
@@ -1245,17 +1246,30 @@ func (c *DirectoryCache) applyTombstone(rec lad.Record) {
 // NextLamportClock increments and returns the local Lamport clock.
 // Used by publishers to stamp outgoing records before ledger append.
 func (c *DirectoryCache) NextLamportClock() uint64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lamportClock++
-	return c.lamportClock
+	return c.lamportClock.Add(1)
 }
 
 // CurrentLamportClock returns the current Lamport clock value without incrementing.
 func (c *DirectoryCache) CurrentLamportClock() uint64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.lamportClock
+	return c.lamportClock.Load()
+}
+
+// updateLamport applies the standard Lamport update: max(local, received) + 1.
+// CAS-loops over the atomic so concurrent Apply calls converge without
+// holding c.mu. A duplicate Apply on the same record may bump the clock
+// twice, which is harmless: Lamport just needs monotonicity, not
+// uniqueness.
+func (c *DirectoryCache) updateLamport(received uint64) {
+	for {
+		cur := c.lamportClock.Load()
+		next := cur + 1
+		if received > cur {
+			next = received + 1
+		}
+		if c.lamportClock.CompareAndSwap(cur, next) {
+			return
+		}
+	}
 }
 
 func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
@@ -2024,7 +2038,7 @@ func (c *DirectoryCache) ChangesSinceHLC(topic lad.Topic, since uint64) ([]lad.R
 					NodeID:       m.NodeID,
 					Body:         body,
 					Timestamp:    m.CreatedAt,
-					LamportClock: c.lamportClock, // best-effort: exact per-record LC not stored on typed records
+					LamportClock: c.lamportClock.Load(), // best-effort: exact per-record LC not stored on typed records
 				}
 				// Use timestamp-derived ordering when per-record LC is not available
 				if uint64(m.CreatedAt.UnixNano()) > since {
