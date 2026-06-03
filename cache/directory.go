@@ -715,6 +715,34 @@ func (c *DirectoryCache) EvictNode(nodeID string, reason string) {
 	c.store.DeleteGossipSeen(nodeID)
 }
 
+// EvictPeer is the third-party variant of EvictNode: it removes all
+// records for a peer that THIS node has locally confirmed dead (failed
+// keepalive, IsClosed() session, etc.) and emits PROPAGATING tombstones
+// so every other observer converges on the same view.
+//
+// Unlike EvictNode (which is invoked only from graceful self-Shutdown
+// with the non-propagating "liveness-local" reason), EvictPeer is the
+// front-runner for the 16-minute GossipLivenessTimeout: when the caller
+// has direct evidence a peer is dead (session closed + redial failed +
+// gossip silence), there is no reason to wait for the slow LAD timer.
+//
+// reason should be a short, descriptive string ("keepalive-dead",
+// "zombie-sweep", etc.); anything other than the literal "liveness"
+// (which emitTombstone rewrites to "liveness-local") will propagate.
+// "keepalive-dead" is the recommended default to make logs greppable.
+//
+// Pair EvictPeer with swarm.PublishObserverTombstone for the matching
+// swarm convergence — both signals are needed to fully clear a ghost.
+func (c *DirectoryCache) EvictPeer(nodeID, reason string) {
+	if reason == "" || reason == "liveness" {
+		// "liveness" is the rewrite trigger inside emitTombstone — never
+		// pass it from this path or the tombstone becomes local-only and
+		// the whole point (propagation) is lost.
+		reason = "keepalive-dead"
+	}
+	c.EvictNode(nodeID, reason)
+}
+
 // EvictExpired removes stale records from the cache.
 // Member and reach records are evicted by gossip liveness timeout.
 // Latency records are evicted by TTL. Tombstones are evicted after tombstoneTTL.
