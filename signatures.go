@@ -16,10 +16,17 @@ var (
 )
 
 // SignRecord signs a record's content with the given Ed25519 private key.
-// Sets AuthorPubKey and Signature fields on the record.
+// Sets AuthorPubKey and Signature fields on the record. AuthorPubKey
+// MUST be assigned before computing signatureContent — signatureContent
+// reads rec.AuthorPubKey, so signing the record with an empty pubkey
+// here produces bytes the receiver cannot reproduce (the wire carries
+// the 32-byte pubkey, but the signed bytes would carry a 4-byte zero
+// length). The ordering bug here is what every signed-topic record on
+// the wire was failing verify against — VerifyRecord's
+// reconstructed content always disagreed with the signer's content.
 func SignRecord(rec *Record, privateKey ed25519.PrivateKey) {
-	content := signatureContent(rec)
 	rec.AuthorPubKey = privateKey.Public().(ed25519.PublicKey)
+	content := signatureContent(rec)
 	rec.Signature = ed25519.Sign(privateKey, content)
 }
 
