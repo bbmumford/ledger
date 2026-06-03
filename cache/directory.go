@@ -6,6 +6,7 @@ package cache
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +73,15 @@ type CacheStatsReport struct {
 type DirectoryCache struct {
 	mu    sync.RWMutex
 	store CacheStore
+
+	// dumpSigningKey signs records rebuilt from typed projections in
+	// Dump() / DumpSince() so the gossip emit path produces wire records
+	// the receiving peer's signedTopicACL can verify. Without it, Dump
+	// strips AuthorPubKey/Signature from MemberRecord/RoleRecord/ReachRecord
+	// projections and every gossiped record fails verify on receive.
+	// Set via SetDumpSigningKey at runtime startup; nil disables the
+	// behaviour (tests, single-node deployments).
+	dumpSigningKey ed25519.PrivateKey
 
 	// localNodeID identifies the record owner that this cache runs on.
 	// When set (via SetLocalNodeID), EvictExpired skips removal of
@@ -528,6 +538,16 @@ func NewDirectoryCache(stores ...CacheStore) *DirectoryCache {
 // Store returns the underlying CacheStore for advanced usage.
 func (c *DirectoryCache) Store() CacheStore {
 	return c.store
+}
+
+// SetDumpSigningKey wires the private key used to re-sign envelopes
+// rebuilt from typed projections inside Dump() / DumpSince(). Call once
+// at runtime startup with the local node's identity key so gossiped
+// records carry valid lad envelope signatures.
+func (c *DirectoryCache) SetDumpSigningKey(priv ed25519.PrivateKey) {
+	c.mu.Lock()
+	c.dumpSigningKey = priv
+	c.mu.Unlock()
 }
 
 // RecordGossipSeen marks a nodeID as alive (seen in gossip exchange).
@@ -1710,6 +1730,13 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 	var records []lad.Record
 	now := time.Now()
 
+	signingKey := c.dumpSigningKey
+	signEnvelope := func(rec *lad.Record) {
+		if signingKey != nil {
+			lad.SignRecord(rec, signingKey)
+		}
+	}
+
 	// Members
 	for _, members := range c.store.AllMembers() {
 		for _, m := range members {
@@ -1717,13 +1744,15 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 				continue
 			}
 			body, _ := json.Marshal(m)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicMember,
 				TenantID:  m.TenantID,
 				NodeID:    m.NodeID,
 				Body:      body,
 				Timestamp: m.CreatedAt,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
@@ -1734,13 +1763,15 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 				continue
 			}
 			body, _ := json.Marshal(r)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicRole,
 				TenantID:  r.TenantID,
 				NodeID:    r.NodeID,
 				Body:      body,
 				Timestamp: r.Updated,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
@@ -1751,14 +1782,16 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 				continue
 			}
 			body, _ := json.Marshal(r)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicReach,
 				TenantID:  r.TenantID,
 				NodeID:    r.NodeID,
 				Seq:       r.Seq,
 				Body:      body,
 				Timestamp: r.UpdatedAt,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
@@ -1848,17 +1881,26 @@ func (c *DirectoryCache) Dump() []lad.Record {
 	estCount := c.store.CountLatency() + c.store.CountTombstones() + 50 // +50 for members/roles/reach
 	records := make([]lad.Record, 0, estCount)
 
+	signingKey := c.dumpSigningKey
+	signEnvelope := func(rec *lad.Record) {
+		if signingKey != nil {
+			lad.SignRecord(rec, signingKey)
+		}
+	}
+
 	// Members
 	for _, members := range c.store.AllMembers() {
 		for _, m := range members {
 			body, _ := json.Marshal(m)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicMember,
 				TenantID:  m.TenantID,
 				NodeID:    m.NodeID,
 				Body:      body,
 				Timestamp: m.CreatedAt,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
@@ -1866,13 +1908,15 @@ func (c *DirectoryCache) Dump() []lad.Record {
 	for _, roles := range c.store.AllRoles() {
 		for _, r := range roles {
 			body, _ := json.Marshal(r)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicRole,
 				TenantID:  r.TenantID,
 				NodeID:    r.NodeID,
 				Body:      body,
 				Timestamp: r.Updated,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
@@ -1884,14 +1928,16 @@ func (c *DirectoryCache) Dump() []lad.Record {
 				continue
 			}
 			body, _ := json.Marshal(r)
-			records = append(records, lad.Record{
+			rec := lad.Record{
 				Topic:     lad.TopicReach,
 				TenantID:  r.TenantID,
 				NodeID:    r.NodeID,
 				Seq:       r.Seq,
 				Body:      body,
 				Timestamp: r.UpdatedAt,
-			})
+			}
+			signEnvelope(&rec)
+			records = append(records, rec)
 		}
 	}
 
