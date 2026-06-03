@@ -976,8 +976,28 @@ func (c *DirectoryCache) EvictExpired() int {
 	return removed
 }
 
+// ApplyLocal ingests a ledger record into the cache WITHOUT the topic
+// ACL check. Intended for trusted in-process bridges (e.g. swarm
+// PeerRecord → LAD reach view) where the upstream source has already
+// verified its own signature in a different signature scheme that
+// lad.VerifyRecord cannot speak. Behaves identically to Apply in all
+// other respects: HLC ordering, tombstone-blocking, projection
+// updates, observability counters.
+//
+// External record ingress (gossip frames, replay from another node)
+// MUST continue to use Apply so the ACL fires. ApplyLocal is for
+// trusted in-process callers that have their own independent identity
+// + signature verification.
+func (c *DirectoryCache) ApplyLocal(rec lad.Record) error {
+	return c.applyCore(rec, true)
+}
+
 // Apply ingests a ledger record into the cache.
 func (c *DirectoryCache) Apply(rec lad.Record) error {
+	return c.applyCore(rec, false)
+}
+
+func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	// Phase G3: Update Lamport clock — max(local, received) + 1
 	c.mu.Lock()
 	if rec.LamportClock > c.lamportClock {
@@ -1028,7 +1048,9 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 	}
 
 	// ACL check — reject record before merge if topic has an ACL function.
-	if c.aclFuncs != nil {
+	// Skipped for trusted in-process bridge calls (ApplyLocal) — see the
+	// ApplyLocal doc-comment for the rationale.
+	if !skipACL && c.aclFuncs != nil {
 		if aclFn, ok := c.aclFuncs[rec.Topic]; ok {
 			if err := aclFn(string(rec.Topic), rec.AuthorPubKey, rec); err != nil {
 				return err
