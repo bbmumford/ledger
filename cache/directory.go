@@ -1007,14 +1007,19 @@ func (c *DirectoryCache) EvictExpired() int {
 // ACL check. Intended for trusted in-process bridges (e.g. swarm
 // PeerRecord → LAD reach view) where the upstream source has already
 // verified its own signature in a different signature scheme that
-// lad.VerifyRecord cannot speak. Behaves identically to Apply in all
-// other respects: HLC ordering, tombstone-blocking, projection
-// updates, observability counters.
+// lad.VerifyRecord (ledger/signatures.go) cannot speak. Behaves
+// identically to Apply in all other respects: HLC ordering,
+// tombstone-blocking, projection updates, observability counters.
 //
 // External record ingress (gossip frames, replay from another node)
-// MUST continue to use Apply so the ACL fires. ApplyLocal is for
-// trusted in-process callers that have their own independent identity
-// + signature verification.
+// MUST continue to use Apply so the ACL (lad.ACLFunc, ledger/acl.go)
+// fires. ApplyLocal is for an ENUMERATED ALLOWLIST of trusted in-process
+// callers that perform their own independent identity + signature
+// verification. The contract, the current allowlist, and the rationale
+// for why it can only be review-enforced (cross-module) live in the
+// package doc — see doc.go ("Cache ingress trust contract") and the
+// guards in trust_contract_test.go. Do not add an ApplyLocal caller
+// without updating both.
 func (c *DirectoryCache) ApplyLocal(rec lad.Record) error {
 	return c.applyCore(rec, true)
 }
