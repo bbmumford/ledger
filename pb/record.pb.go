@@ -28,20 +28,20 @@ const (
 type LADRecord struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Topic           string                 `protobuf:"bytes,1,opt,name=topic,proto3" json:"topic,omitempty"`
-	NodeId          string                 `protobuf:"bytes,2,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	TenantId        string                 `protobuf:"bytes,3,opt,name=tenant_id,json=tenantId,proto3" json:"tenant_id,omitempty"`
+	NodeId          string                 `protobuf:"bytes,2,opt,name=nodeId,proto3" json:"nodeId,omitempty"`
+	TenantId        string                 `protobuf:"bytes,3,opt,name=tenantId,proto3" json:"tenantId,omitempty"`
 	Body            []byte                 `protobuf:"bytes,4,opt,name=body,proto3" json:"body,omitempty"`
-	TimestampUnix   int64                  `protobuf:"varint,5,opt,name=timestamp_unix,json=timestampUnix,proto3" json:"timestamp_unix,omitempty"`
-	LamportClock    uint64                 `protobuf:"varint,6,opt,name=lamport_clock,json=lamportClock,proto3" json:"lamport_clock,omitempty"`
+	TimestampUnix   int64                  `protobuf:"varint,5,opt,name=timestampUnix,proto3" json:"timestampUnix,omitempty"`
+	LamportClock    uint64                 `protobuf:"varint,6,opt,name=lamportClock,proto3" json:"lamportClock,omitempty"`
 	Seq             uint64                 `protobuf:"varint,7,opt,name=seq,proto3" json:"seq,omitempty"`
 	Tombstone       bool                   `protobuf:"varint,8,opt,name=tombstone,proto3" json:"tombstone,omitempty"`
-	DeletedAtUnix   int64                  `protobuf:"varint,9,opt,name=deleted_at_unix,json=deletedAtUnix,proto3" json:"deleted_at_unix,omitempty"`
-	TombstoneReason string                 `protobuf:"bytes,10,opt,name=tombstone_reason,json=tombstoneReason,proto3" json:"tombstone_reason,omitempty"`
+	DeletedAtUnix   int64                  `protobuf:"varint,9,opt,name=deletedAtUnix,proto3" json:"deletedAtUnix,omitempty"`
+	TombstoneReason string                 `protobuf:"bytes,10,opt,name=tombstoneReason,proto3" json:"tombstoneReason,omitempty"`
 	Signature       []byte                 `protobuf:"bytes,11,opt,name=signature,proto3" json:"signature,omitempty"`
-	HlcTimestamp    uint64                 `protobuf:"varint,12,opt,name=hlc_timestamp,json=hlcTimestamp,proto3" json:"hlc_timestamp,omitempty"`
-	AuthorPubkey    []byte                 `protobuf:"bytes,13,opt,name=author_pubkey,json=authorPubkey,proto3" json:"author_pubkey,omitempty"`
-	BlobCid         string                 `protobuf:"bytes,14,opt,name=blob_cid,json=blobCid,proto3" json:"blob_cid,omitempty"`
-	ExpiresAtUnix   int64                  `protobuf:"varint,15,opt,name=expires_at_unix,json=expiresAtUnix,proto3" json:"expires_at_unix,omitempty"`
+	HlcTimestamp    uint64                 `protobuf:"varint,12,opt,name=hlcTimestamp,proto3" json:"hlcTimestamp,omitempty"`
+	AuthorPubkey    []byte                 `protobuf:"bytes,13,opt,name=authorPubkey,proto3" json:"authorPubkey,omitempty"`
+	BlobCid         string                 `protobuf:"bytes,14,opt,name=blobCid,proto3" json:"blobCid,omitempty"`
+	ExpiresAtUnix   int64                  `protobuf:"varint,15,opt,name=expiresAtUnix,proto3" json:"expiresAtUnix,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -185,24 +185,24 @@ var File_pb_record_proto protoreflect.FileDescriptor
 
 const file_pb_record_proto_rawDesc = "" +
 	"\n" +
-	"\x0fpb/record.proto\x12\tledger.v1\"\xe5\x03\n" +
+	"\x0fpb/record.proto\x12\tledger.v1\"\xd9\x03\n" +
 	"\tLADRecord\x12\x14\n" +
-	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x17\n" +
-	"\anode_id\x18\x02 \x01(\tR\x06nodeId\x12\x1b\n" +
-	"\ttenant_id\x18\x03 \x01(\tR\btenantId\x12\x12\n" +
-	"\x04body\x18\x04 \x01(\fR\x04body\x12%\n" +
-	"\x0etimestamp_unix\x18\x05 \x01(\x03R\rtimestampUnix\x12#\n" +
-	"\rlamport_clock\x18\x06 \x01(\x04R\flamportClock\x12\x10\n" +
+	"\x05topic\x18\x01 \x01(\tR\x05topic\x12\x16\n" +
+	"\x06nodeId\x18\x02 \x01(\tR\x06nodeId\x12\x1a\n" +
+	"\btenantId\x18\x03 \x01(\tR\btenantId\x12\x12\n" +
+	"\x04body\x18\x04 \x01(\fR\x04body\x12$\n" +
+	"\rtimestampUnix\x18\x05 \x01(\x03R\rtimestampUnix\x12\"\n" +
+	"\flamportClock\x18\x06 \x01(\x04R\flamportClock\x12\x10\n" +
 	"\x03seq\x18\a \x01(\x04R\x03seq\x12\x1c\n" +
-	"\ttombstone\x18\b \x01(\bR\ttombstone\x12&\n" +
-	"\x0fdeleted_at_unix\x18\t \x01(\x03R\rdeletedAtUnix\x12)\n" +
-	"\x10tombstone_reason\x18\n" +
+	"\ttombstone\x18\b \x01(\bR\ttombstone\x12$\n" +
+	"\rdeletedAtUnix\x18\t \x01(\x03R\rdeletedAtUnix\x12(\n" +
+	"\x0ftombstoneReason\x18\n" +
 	" \x01(\tR\x0ftombstoneReason\x12\x1c\n" +
-	"\tsignature\x18\v \x01(\fR\tsignature\x12#\n" +
-	"\rhlc_timestamp\x18\f \x01(\x04R\fhlcTimestamp\x12#\n" +
-	"\rauthor_pubkey\x18\r \x01(\fR\fauthorPubkey\x12\x19\n" +
-	"\bblob_cid\x18\x0e \x01(\tR\ablobCid\x12&\n" +
-	"\x0fexpires_at_unix\x18\x0f \x01(\x03R\rexpiresAtUnixB Z\x1egithub.com/bbmumford/ledger/pbb\x06proto3"
+	"\tsignature\x18\v \x01(\fR\tsignature\x12\"\n" +
+	"\fhlcTimestamp\x18\f \x01(\x04R\fhlcTimestamp\x12\"\n" +
+	"\fauthorPubkey\x18\r \x01(\fR\fauthorPubkey\x12\x18\n" +
+	"\ablobCid\x18\x0e \x01(\tR\ablobCid\x12$\n" +
+	"\rexpiresAtUnix\x18\x0f \x01(\x03R\rexpiresAtUnixB Z\x1egithub.com/bbmumford/ledger/pbb\x06proto3"
 
 var (
 	file_pb_record_proto_rawDescOnce sync.Once
