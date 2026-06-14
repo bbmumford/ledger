@@ -434,7 +434,7 @@ func TestEvictExpired(t *testing.T) {
 
 	// Manually insert reach records: one expired, one valid.
 	// We bypass storeReach (which now rejects expired) by writing directly.
-	cache.mu.Lock()
+	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-old": {
 			TenantID:  "tenant-1",
@@ -449,7 +449,7 @@ func TestEvictExpired(t *testing.T) {
 			ExpiresAt: time.Now().Add(1 * time.Hour), // still valid
 		},
 	}
-	cache.mu.Unlock()
+	cache.inMemMu.Unlock()
 
 	removed := cache.EvictExpired()
 	if removed != 1 {
@@ -473,7 +473,7 @@ func TestEvictExpiredCleansEmptyTenantMaps(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	// Insert a single expired record for a tenant.
-	cache.mu.Lock()
+	cache.inMemMu.Lock()
 	cache.reach["tenant-gone"] = map[string]lad.ReachRecord{
 		"node-1": {
 			TenantID:  "tenant-gone",
@@ -481,13 +481,13 @@ func TestEvictExpiredCleansEmptyTenantMaps(t *testing.T) {
 			ExpiresAt: time.Now().Add(-1 * time.Minute),
 		},
 	}
-	cache.mu.Unlock()
+	cache.inMemMu.Unlock()
 
 	cache.EvictExpired()
 
-	cache.mu.RLock()
+	cache.inMemMu.RLock()
 	_, exists := cache.reach["tenant-gone"]
-	cache.mu.RUnlock()
+	cache.inMemMu.RUnlock()
 	if exists {
 		t.Error("Expected empty tenant map to be removed after eviction")
 	}
@@ -504,9 +504,9 @@ func TestStoreReachRejectsExpired(t *testing.T) {
 	body, _ := json.Marshal(reach)
 	cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
 
-	cache.mu.RLock()
+	cache.inMemMu.RLock()
 	count := len(cache.reach["tenant-1"])
-	cache.mu.RUnlock()
+	cache.inMemMu.RUnlock()
 	if count != 0 {
 		t.Errorf("Expected expired record to be rejected, but %d records stored", count)
 	}
@@ -550,7 +550,7 @@ func TestDumpSkipsExpiredReach(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	// Manually insert: one expired, one valid.
-	cache.mu.Lock()
+	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-expired": {
 			TenantID:  "tenant-1",
@@ -563,7 +563,7 @@ func TestDumpSkipsExpiredReach(t *testing.T) {
 			ExpiresAt: time.Now().Add(1 * time.Hour),
 		},
 	}
-	cache.mu.Unlock()
+	cache.inMemMu.Unlock()
 
 	records := cache.Dump()
 	reachCount := 0
@@ -584,7 +584,7 @@ func TestStartStopEviction(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	// Insert an expired record directly.
-	cache.mu.Lock()
+	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-1": {
 			TenantID:  "tenant-1",
@@ -592,7 +592,7 @@ func TestStartStopEviction(t *testing.T) {
 			ExpiresAt: time.Now().Add(-1 * time.Second),
 		},
 	}
-	cache.mu.Unlock()
+	cache.inMemMu.Unlock()
 
 	// Start eviction with a very short interval.
 	cache.StartEviction(50 * time.Millisecond)
@@ -602,9 +602,9 @@ func TestStartStopEviction(t *testing.T) {
 
 	cache.StopEviction()
 
-	cache.mu.RLock()
+	cache.inMemMu.RLock()
 	count := len(cache.reach["tenant-1"])
-	cache.mu.RUnlock()
+	cache.inMemMu.RUnlock()
 	if count != 0 {
 		t.Errorf("Expected expired record to be evicted by background sweep, but %d remain", count)
 	}

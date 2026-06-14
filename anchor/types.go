@@ -18,7 +18,7 @@ type Snapshot struct {
 type SnapshotHeader struct {
 	Timestamp int64  `json:"ts"`
 	Sequence  uint64 `json:"seq"`
-	NodeID    string `json:"node_id"` // ID of the anchor node that generated this
+	NodeID    string `json:"nodeId"` // ID of the anchor node that generated this
 	Signature []byte `json:"sig"`     // Ed25519 signature of the snapshot content
 }
 
@@ -26,6 +26,6 @@ type SnapshotHeader struct {
 type SnapshotContent struct {
 	Timestamp int64        `json:"ts"`
 	Sequence  uint64       `json:"seq"`
-	NodeID    string       `json:"node_id"`
+	NodeID    string       `json:"nodeId"`
 	Records   []lad.Record `json:"records"`
 }

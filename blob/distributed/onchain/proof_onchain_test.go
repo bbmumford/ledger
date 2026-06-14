@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-package distributed
+package onchain
 
 import (
 	"bytes"
@@ -21,9 +21,6 @@ import (
 //
 //   piece = "plutus-storage-escrow-test-piece"  (32 ASCII bytes)
 //   nonce = 0x00..1F                             (32 incrementing bytes)
-//
-// Expected hash (keccak256 of the 64-byte concatenation):
-//   0xcc6283b9c73ea4e92b2ad39c4ef27a4a9a9e2d1b3395aaee9692a4cfb27f93de
 //
 // If a future change rewires the hash primitive, this test + the contract
 // must be updated in lockstep: the on-chain expectedHash derivation MUST

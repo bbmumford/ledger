@@ -20,7 +20,7 @@ func TestReachRecord_MetadataRoundTrip(t *testing.T) {
 	// lad.Record.Body. Body is unmarshaled by lad.UnmarshalReach into
 	// lad.ReachRecord and stored in the cache.
 	type reachWithMeta struct {
-		NodeID   string            `json:"node_id"`
+		NodeID   string            `json:"nodeId"`
 		TenantID string            `json:"tenant"`
 		Region   string            `json:"region"`
 		Metadata map[string]string `json:"meta,omitempty"`
@@ -101,7 +101,7 @@ func TestCache_DeltaApplierRebuildsFullRecord(t *testing.T) {
 	}
 
 	// Send a delta (body shape irrelevant — applier rewrites).
-	deltaBody := []byte(`{"node_id":"vl1_alice","tenant":"","v":32769,"ops":[]}`)
+	deltaBody := []byte(`{"nodeId":"vl1_alice","tenant":"","v":32769,"ops":[]}`)
 	if err := c.Apply(lad.Record{
 		Topic:     lad.TopicReach,
 		NodeID:    "vl1_alice",
@@ -172,7 +172,7 @@ func TestCache_SkipsReachDelta(t *testing.T) {
 	}
 
 	// Send a delta — should be SKIPPED
-	deltaBody := []byte(`{"node_id":"vl1_alice","tenant":"","v":32769,"hlc":{"wall":0,"logical":0},"ops":[]}`)
+	deltaBody := []byte(`{"nodeId":"vl1_alice","tenant":"","v":32769,"hlc":{"wall":0,"logical":0},"ops":[]}`)
 	if err := c.Apply(lad.Record{
 		Topic:    lad.TopicReach,
 		NodeID:   "vl1_alice",

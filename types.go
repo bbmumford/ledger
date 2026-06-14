@@ -42,19 +42,19 @@ func (cw CausalWatermark) Copy() CausalWatermark {
 type Record struct {
 	Topic           Topic           `json:"topic"`
 	Seq             uint64          `json:"seq"`
-	TenantID        string          `json:"tenant_id"`
-	NodeID          string          `json:"node_id"`
+	TenantID        string          `json:"tenantId"`
+	NodeID          string          `json:"nodeId"`
 	Body            json.RawMessage `json:"body"`
 	Signature       []byte          `json:"sig"`
 	Timestamp       time.Time       `json:"ts"`
 	LamportClock    uint64          `json:"lc,omitempty"`               // causal ordering
 	HLCTimestamp    uint64          `json:"hlc,omitempty"`              // hybrid logical clock (0 = unused)
 	Tombstone       bool            `json:"tombstone,omitempty"`        // true = deletion marker
-	DeletedAt       time.Time       `json:"deleted_at,omitempty"`
-	TombstoneReason string          `json:"tombstone_reason,omitempty"` // "explicit", "cap"
-	ExpiresAt       time.Time       `json:"expires_at,omitempty"`       // TTL expiration (zero = never)
-	AuthorPubKey    []byte          `json:"author_pubkey,omitempty"`    // Ed25519 public key of record author
-	BlobCID         string          `json:"blob_cid,omitempty"`         // content-addressed blob reference
+	DeletedAt       time.Time       `json:"deletedAt,omitempty"`
+	TombstoneReason string          `json:"tombstoneReason,omitempty"` // "explicit", "cap"
+	ExpiresAt       time.Time       `json:"expiresAt,omitempty"`       // TTL expiration (zero = never)
+	AuthorPubKey    []byte          `json:"authorPubkey,omitempty"`    // Ed25519 public key of record author
+	BlobCID         string          `json:"blobCid,omitempty"`         // content-addressed blob reference
 }
 
 // MergeFunc resolves conflicts between an existing record and an incoming record.
@@ -122,18 +122,18 @@ type MetricsRecorder interface {
 // HandlerMetadata describes security requirements for a handler
 type HandlerMetadata struct {
 	Name           string   `json:"name"`
-	RequiresAuth   bool     `json:"requires_auth"`
-	RequiredScopes []string `json:"required_scopes,omitempty"`
-	TimeoutMs      int      `json:"timeout_ms"`
+	RequiresAuth   bool     `json:"requiresAuth"`
+	RequiredScopes []string `json:"requiredScopes,omitempty"`
+	TimeoutMs      int      `json:"timeoutMs"`
 }
 
 // MemberRecord mirrors the MemberAdd log schema once decoded.
 type MemberRecord struct {
 	TenantID  string            `json:"tenant"`
-	NodeID    string            `json:"node_id"`
+	NodeID    string            `json:"nodeId"`
 	PubKey    []byte            `json:"pubkey"`
-	CreatedAt time.Time         `json:"created_at"`
-	ExpiresAt time.Time         `json:"expires_at,omitempty"`
+	CreatedAt time.Time         `json:"createdAt"`
+	ExpiresAt time.Time         `json:"expiresAt,omitempty"`
 	Attrs     map[string]string `json:"attrs,omitempty"`
 	Handlers  []HandlerMetadata `json:"handlers,omitempty"` // Handler security metadata
 }
@@ -141,10 +141,10 @@ type MemberRecord struct {
 // RoleRecord mirrors the RoleSet schema.
 type RoleRecord struct {
 	TenantID string            `json:"tenant"`
-	NodeID   string            `json:"node_id"`
+	NodeID   string            `json:"nodeId"`
 	Roles    []string          `json:"roles"`
 	Handlers []HandlerMetadata `json:"handlers,omitempty"` // Handler security metadata
-	MaxGrade int               `json:"max_grade,omitempty"` // Highest grade this node can support (0-4)
+	MaxGrade int               `json:"maxGrade,omitempty"` // Highest grade this node can support (0-4)
 	Updated  time.Time         `json:"ts"`
 }
 
@@ -174,16 +174,16 @@ func (a ReachAddress) DialAddress() string {
 // ReachRecord mirrors the ReachSet schema plus derived metrics.
 type ReachRecord struct {
 	TenantID      string         `json:"tenant"`
-	NodeID        string         `json:"node_id"`
+	NodeID        string         `json:"nodeId"`
 	Seq           uint64         `json:"seq"`
 	Addresses     []ReachAddress `json:"addrs"`
 	Region        string         `json:"region"` // Hosting region (e.g., "iad", "us-east-1")
-	NATType       string         `json:"nat_type"`
-	NATObserved   string         `json:"nat_observed"`
-	LatencyMillis int64          `json:"latency_ms"`
+	NATType       string         `json:"natType"`
+	NATObserved   string         `json:"natObserved"`
+	LatencyMillis int64          `json:"latencyMs"`
 	Availability  float64        `json:"availability"`
-	LoadFactor    float64        `json:"load_factor"` // 0.0 (idle) to 1.0 (overloaded)
-	ExpiresAt     time.Time      `json:"expires_at"`
+	LoadFactor    float64        `json:"loadFactor"` // 0.0 (idle) to 1.0 (overloaded)
+	ExpiresAt     time.Time      `json:"expiresAt"`
 	UpdatedAt     time.Time      `json:"ts"`
 
 	// SchemaVersion lets the cache detect delta-encoded bodies (bit 15
@@ -225,13 +225,13 @@ func (r ReachRecord) LatencyDuration() time.Duration {
 // LatencyRecord stores a directional RTT measurement between two nodes.
 // Published by the measuring node: "I measured Xms RTT to peer Y."
 type LatencyRecord struct {
-	FromNode     string    `json:"from_node"`
-	ToNode       string    `json:"to_node"`
-	RTTMs        int64     `json:"rtt_ms"`                        // Application RTT (gossip/data exchange latency)
-	InitialRTTMs int64     `json:"initial_rtt_ms,omitempty"`      // Network RTT (connection setup latency)
+	FromNode     string    `json:"fromNode"`
+	ToNode       string    `json:"toNode"`
+	RTTMs        int64     `json:"rttMs"`                        // Application RTT (gossip/data exchange latency)
+	InitialRTTMs int64     `json:"initialRttMs,omitempty"`      // Network RTT (connection setup latency)
 	Transport    string    `json:"transport,omitempty"`            // "noise-udp" or "gossip-tls"
-	MeasuredAt   time.Time `json:"measured_at"`
-	ExpiresAt    time.Time `json:"expires_at"`
+	MeasuredAt   time.Time `json:"measuredAt"`
+	ExpiresAt    time.Time `json:"expiresAt"`
 }
 
 // ReachQuery provides filters for querying reachability records

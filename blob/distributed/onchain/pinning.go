@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-package distributed
+package onchain
 
 // Paid-pinning workflow.
 //
@@ -111,14 +111,14 @@ type PinRequest struct {
 // escrow. Presence of EscrowAddress tells the seller to consider
 // this replicator committed.
 type PinAcceptance struct {
-	RequestID      string `json:"requestId"`
-	CID            string `json:"cid"`
-	ReplicatorID   string `json:"replicatorId"`
-	ReplicatorPub  []byte `json:"replicatorPub"`
-	EscrowChain    string `json:"escrowChain"`
-	EscrowAddress  string `json:"escrowAddress"`
-	AcceptedAtUnixMs int64 `json:"acceptedAtMs"`
-	Sig            []byte `json:"sig,omitempty"`
+	RequestID        string `json:"requestId"`
+	CID              string `json:"cid"`
+	ReplicatorID     string `json:"replicatorId"`
+	ReplicatorPub    []byte `json:"replicatorPub"`
+	EscrowChain      string `json:"escrowChain"`
+	EscrowAddress    string `json:"escrowAddress"`
+	AcceptedAtUnixMs int64  `json:"acceptedAtMs"`
+	Sig              []byte `json:"sig,omitempty"`
 }
 
 // ReplicatorID is a lightweight alias so call sites reading
@@ -155,7 +155,7 @@ func (r PinRequest) signPayload() []byte {
 // + other fields.
 func (r *PinRequest) Sign(key ed25519.PrivateKey) error {
 	if len(key) != ed25519.PrivateKeySize {
-		return errors.New("distributed: bad signer key")
+		return errors.New("onchain: bad signer key")
 	}
 	r.SellerPubKey = key.Public().(ed25519.PublicKey)
 	r.SellerSig = ed25519.Sign(key, r.signPayload())
@@ -167,13 +167,13 @@ func (r *PinRequest) Sign(key ed25519.PrivateKey) error {
 // rejected.
 func (r PinRequest) Verify() error {
 	if len(r.SellerPubKey) != ed25519.PublicKeySize {
-		return errors.New("distributed: bad seller pubkey")
+		return errors.New("onchain: bad seller pubkey")
 	}
 	if len(r.SellerSig) == 0 {
-		return errors.New("distributed: request not signed")
+		return errors.New("onchain: request not signed")
 	}
 	if !ed25519.Verify(ed25519.PublicKey(r.SellerPubKey), r.signPayload(), r.SellerSig) {
-		return errors.New("distributed: seller sig verification failed")
+		return errors.New("onchain: seller sig verification failed")
 	}
 	return nil
 }
@@ -201,7 +201,7 @@ func (a PinAcceptance) signBytes() []byte {
 // Sign fills in a.Sig.
 func (a *PinAcceptance) Sign(key ed25519.PrivateKey) error {
 	if len(key) != ed25519.PrivateKeySize {
-		return errors.New("distributed: bad signer key")
+		return errors.New("onchain: bad signer key")
 	}
 	a.ReplicatorPub = key.Public().(ed25519.PublicKey)
 	a.Sig = ed25519.Sign(key, a.signBytes())
@@ -211,13 +211,13 @@ func (a *PinAcceptance) Sign(key ed25519.PrivateKey) error {
 // Verify checks a.Sig against a.ReplicatorPub.
 func (a PinAcceptance) Verify() error {
 	if len(a.ReplicatorPub) != ed25519.PublicKeySize {
-		return errors.New("distributed: bad replicator pubkey")
+		return errors.New("onchain: bad replicator pubkey")
 	}
 	if len(a.Sig) == 0 {
-		return errors.New("distributed: acceptance not signed")
+		return errors.New("onchain: acceptance not signed")
 	}
 	if !ed25519.Verify(ed25519.PublicKey(a.ReplicatorPub), a.signBytes(), a.Sig) {
-		return errors.New("distributed: acceptance sig verification failed")
+		return errors.New("onchain: acceptance sig verification failed")
 	}
 	return nil
 }
@@ -332,10 +332,10 @@ type Pinner struct {
 // read acceptances out-of-band.
 func NewPinner(pub PinPublisher, sub PinAcceptanceSubscriber, cfg PinnerConfig) (*Pinner, error) {
 	if pub == nil {
-		return nil, errors.New("distributed: pinner needs a publisher")
+		return nil, errors.New("onchain: pinner needs a publisher")
 	}
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
-		return nil, errors.New("distributed: pinner needs a valid Ed25519 private key")
+		return nil, errors.New("onchain: pinner needs a valid Ed25519 private key")
 	}
 	topic := cfg.RequestTopic
 	if topic == "" {
@@ -363,16 +363,16 @@ func NewPinner(pub PinPublisher, sub PinAcceptanceSubscriber, cfg PinnerConfig) 
 // inspect / adjust before calling PublishPinRequest.
 func (p *Pinner) BuildRequest(params PinRequestParams) (PinRequest, error) {
 	if params.CID == "" {
-		return PinRequest{}, errors.New("distributed: empty cid")
+		return PinRequest{}, errors.New("onchain: empty cid")
 	}
 	if params.Duration < 7*24*time.Hour {
-		return PinRequest{}, errors.New("distributed: duration must be >= 1 week")
+		return PinRequest{}, errors.New("onchain: duration must be >= 1 week")
 	}
 	if params.ReplicationFactor <= 0 {
-		return PinRequest{}, errors.New("distributed: replication factor must be > 0")
+		return PinRequest{}, errors.New("onchain: replication factor must be > 0")
 	}
 	if params.FeePerReplicator == nil || params.FeePerReplicator.Sign() <= 0 {
-		return PinRequest{}, errors.New("distributed: fee must be positive")
+		return PinRequest{}, errors.New("onchain: fee must be positive")
 	}
 	total := new(big.Int).Mul(params.FeePerReplicator, big.NewInt(int64(params.ReplicationFactor)))
 	req := PinRequest{
@@ -418,14 +418,14 @@ type PinRequestParams struct {
 // nil) immediately after publishing (no collection).
 func (p *Pinner) PublishPinRequest(ctx context.Context, req PinRequest) ([]ReplicatorID, error) {
 	if err := req.Verify(); err != nil {
-		return nil, fmt.Errorf("distributed: refusing to publish unsigned/invalid request: %w", err)
+		return nil, fmt.Errorf("onchain: refusing to publish unsigned/invalid request: %w", err)
 	}
 	payload, err := json.Marshal(&req)
 	if err != nil {
-		return nil, fmt.Errorf("distributed: marshal pin request: %w", err)
+		return nil, fmt.Errorf("onchain: marshal pin request: %w", err)
 	}
 	if err := p.pub.Publish(p.topic, payload); err != nil {
-		return nil, fmt.Errorf("distributed: publish: %w", err)
+		return nil, fmt.Errorf("onchain: publish: %w", err)
 	}
 	if p.subscriber == nil {
 		return nil, nil
@@ -519,14 +519,14 @@ func (p *Pinner) PublishPinRequest(ctx context.Context, req PinRequest) ([]Repli
 
 // PinPolicyConfig mirrors the TOML snippet in ROADMAP.md section 2.
 type PinPolicyConfig struct {
-	Enabled                bool
-	MaxTotalPinnedBytes    int64
-	MinFeeRatePerMBMonth   float64 // in whatever unit the seller's chain uses; the replicator computes against this
-	MaxCommitmentWeeks     int
-	AllowedRecordTypes     []string
-	MinSellerReputation    float64
-	PreferredChains        []string // non-empty = only accept if at least one match is in req.AcceptedPaymentChains
-	PreferredChainID       string   // chain the replicator's escrow will be deployed on
+	Enabled              bool
+	MaxTotalPinnedBytes  int64
+	MinFeeRatePerMBMonth float64 // in whatever unit the seller's chain uses; the replicator computes against this
+	MaxCommitmentWeeks   int
+	AllowedRecordTypes   []string
+	MinSellerReputation  float64
+	PreferredChains      []string // non-empty = only accept if at least one match is in req.AcceptedPaymentChains
+	PreferredChainID     string   // chain the replicator's escrow will be deployed on
 	// MinPieceSizeBytes / MaxPieceSizeBytes gate by size. Zero = no limit.
 	MinPieceSizeBytes int64
 	MaxPieceSizeBytes int64
@@ -548,11 +548,11 @@ type PinAcceptorConfig struct {
 // incoming PinRequests against the local policy and — if all gates
 // pass — creates the on-chain escrow + broadcasts an acceptance.
 type PinAcceptor struct {
-	cfg       PinAcceptorConfig
-	escrow    EscrowClient
-	pub       PinPublisher
-	topic     string
-	now       func() time.Time
+	cfg    PinAcceptorConfig
+	escrow EscrowClient
+	pub    PinPublisher
+	topic  string
+	now    func() time.Time
 }
 
 // NewPinAcceptor wires policy + escrow client + publisher. The
@@ -561,13 +561,13 @@ type PinAcceptor struct {
 // early in that case.
 func NewPinAcceptor(cfg PinAcceptorConfig, escrow EscrowClient, pub PinPublisher) (*PinAcceptor, error) {
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
-		return nil, errors.New("distributed: acceptor needs a valid Ed25519 private key")
+		return nil, errors.New("onchain: acceptor needs a valid Ed25519 private key")
 	}
 	if escrow == nil {
-		return nil, errors.New("distributed: acceptor needs an EscrowClient")
+		return nil, errors.New("onchain: acceptor needs an EscrowClient")
 	}
 	if pub == nil {
-		return nil, errors.New("distributed: acceptor needs a publisher")
+		return nil, errors.New("onchain: acceptor needs a publisher")
 	}
 	now := cfg.Now
 	if now == nil {
@@ -582,7 +582,7 @@ func NewPinAcceptor(cfg PinAcceptorConfig, escrow EscrowClient, pub PinPublisher
 	}, nil
 }
 
-// ErrPolicyReject is returned by evaluatePolicy when the request fails
+// PolicyRejectError is returned by evaluatePolicy when the request fails
 // one or more policy gates. It's wrapped with a reason string; callers
 // get the reason via errors.As on PolicyRejectError below.
 type PolicyRejectError struct {
@@ -590,7 +590,7 @@ type PolicyRejectError struct {
 }
 
 // Error implements error.
-func (e *PolicyRejectError) Error() string { return "distributed: policy reject: " + e.Reason }
+func (e *PolicyRejectError) Error() string { return "onchain: policy reject: " + e.Reason }
 
 // EvaluatePolicy runs the gate logic without any side effects. Exposed
 // for tests + diagnostics.
@@ -675,7 +675,7 @@ func (a *PinAcceptor) HandlePinRequest(ctx context.Context, req PinRequest) (str
 
 	feePerRep, ok := new(big.Int).SetString(req.FeePerReplicator, 10)
 	if !ok {
-		return "", fmt.Errorf("distributed: bad FeePerReplicator: %s", req.FeePerReplicator)
+		return "", fmt.Errorf("onchain: bad FeePerReplicator: %s", req.FeePerReplicator)
 	}
 
 	chain := a.cfg.Policy.PreferredChainID
@@ -696,13 +696,13 @@ func (a *PinAcceptor) HandlePinRequest(ctx context.Context, req PinRequest) (str
 
 	addr, err := a.escrow.CreatePin(ctx, params)
 	if err != nil {
-		return "", fmt.Errorf("distributed: create escrow: %w", err)
+		return "", fmt.Errorf("onchain: create escrow: %w", err)
 	}
 	if _, err := a.escrow.PostBond(ctx, addr); err != nil {
 		// Escrow was deployed but bond failed. Surface the error so the
 		// caller can retry or alert; DO NOT broadcast acceptance (seller
 		// must not consider us committed without bond).
-		return "", fmt.Errorf("distributed: post bond: %w", err)
+		return "", fmt.Errorf("onchain: post bond: %w", err)
 	}
 
 	ack := PinAcceptance{
@@ -714,14 +714,14 @@ func (a *PinAcceptor) HandlePinRequest(ctx context.Context, req PinRequest) (str
 		AcceptedAtUnixMs: a.now().UnixMilli(),
 	}
 	if err := ack.Sign(a.cfg.IdentityKey); err != nil {
-		return addr, fmt.Errorf("distributed: sign acceptance: %w", err)
+		return addr, fmt.Errorf("onchain: sign acceptance: %w", err)
 	}
 	payload, err := json.Marshal(&ack)
 	if err != nil {
-		return addr, fmt.Errorf("distributed: marshal acceptance: %w", err)
+		return addr, fmt.Errorf("onchain: marshal acceptance: %w", err)
 	}
 	if err := a.pub.Publish(TopicPinAccept, payload); err != nil {
-		return addr, fmt.Errorf("distributed: publish acceptance: %w", err)
+		return addr, fmt.Errorf("onchain: publish acceptance: %w", err)
 	}
 	return addr, nil
 }
@@ -731,7 +731,7 @@ func (a *PinAcceptor) HandlePinRequest(ctx context.Context, req PinRequest) (str
 func DecodePinRequest(b []byte) (PinRequest, error) {
 	var r PinRequest
 	if err := json.Unmarshal(b, &r); err != nil {
-		return PinRequest{}, fmt.Errorf("distributed: pin-request decode: %w", err)
+		return PinRequest{}, fmt.Errorf("onchain: pin-request decode: %w", err)
 	}
 	return r, nil
 }
@@ -740,7 +740,7 @@ func DecodePinRequest(b []byte) (PinRequest, error) {
 func DecodePinAcceptance(b []byte) (PinAcceptance, error) {
 	var a PinAcceptance
 	if err := json.Unmarshal(b, &a); err != nil {
-		return PinAcceptance{}, fmt.Errorf("distributed: pin-acceptance decode: %w", err)
+		return PinAcceptance{}, fmt.Errorf("onchain: pin-acceptance decode: %w", err)
 	}
 	return a, nil
 }

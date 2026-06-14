@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-package distributed
+package onchain
 
 import (
 	"context"
@@ -18,8 +18,6 @@ import (
 )
 
 // pinningPublisher captures published topic/payload pairs for inspection.
-// Separate from fakePublisher in advertiser_test.go to avoid redeclaration
-// in the same _test package.
 type pinningPublisher struct {
 	mu       sync.Mutex
 	messages []struct {
