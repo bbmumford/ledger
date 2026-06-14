@@ -39,7 +39,7 @@ func DefaultMultiSigConfig() MultiSigConfig {
 
 // AnchorSignature represents a single anchor's signature on a snapshot.
 type AnchorSignature struct {
-	NodeID    string `json:"node_id"`
+	NodeID    string `json:"nodeId"`
 	Signature []byte `json:"sig"`
 }
 
@@ -54,7 +54,7 @@ type MultiSigSnapshot struct {
 type MultiSigHeader struct {
 	Timestamp  int64  `json:"ts"`
 	Sequence   uint64 `json:"seq"`
-	MerkleRoot []byte `json:"merkle_root,omitempty"` // Optional: Merkle root of records
+	MerkleRoot []byte `json:"merkleRoot,omitempty"` // Optional: Merkle root of records
 }
 
 // Record placeholder - imported from parent package in real use

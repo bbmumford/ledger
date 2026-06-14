@@ -3,7 +3,15 @@
  * Queries: licensing@hstles.com
  */
 
-package distributed
+// Package onchain holds the on-chain proof-of-storage + paid-pinning
+// surface that the rest of the legacy ledger/blob/distributed package
+// no longer needs. The Phase-1 / Phase-2 (chunker, store, advertiser,
+// resolver, fetcher, replicator, abuse, quota, rarest-first) code has
+// moved to github.com/bbmumford/diststore; only the on-chain coupled
+// pieces remain here so the EscrowClient interface + the
+// proof-of-storage challenger / responder can stay close to the
+// PlutusStorageEscrow.sol surface they speak to.
+package onchain
 
 // Proof-of-storage challenge/response protocol.
 //
@@ -125,15 +133,12 @@ func signMessage(cid string, nonce, hash, pub []byte) []byte {
 // digest. Exposed so tests + consumers can precompute the expected
 // hash for in-mesh challenge verification.
 //
-// ┌───────────────────────────────────────────────────────────────┐
-// │ WARNING — NOT for on-chain use.                               │
-// │ Submitting this value as PlutusStorageEscrow.openChallenge's  │
-// │ `expectedHash` argument will ALWAYS cause the replicator's    │
-// │ keccak256 respond(bytes32) to mismatch, producing unjustified │
-// │ misses. Use ComputeOnChainExpectedHash (proof_onchain.go) for │
-// │ any EVM-bound payload. See proof_onchain.go for the full      │
-// │ rationale (BLAKE2b vs keccak256 gas trade-off).               │
-// └───────────────────────────────────────────────────────────────┘
+// WARNING — NOT for on-chain use. Submitting this value as
+// PlutusStorageEscrow.openChallenge's `expectedHash` argument will
+// ALWAYS cause the replicator's keccak256 respond(bytes32) to
+// mismatch, producing unjustified misses. Use
+// ComputeOnChainExpectedHash (proof_onchain.go) for any EVM-bound
+// payload.
 func ComputeProofHash(piece, nonce []byte) []byte {
 	h, _ := blake2b.New256(nil)
 	h.Write(piece)
@@ -146,7 +151,7 @@ func ComputeProofHash(piece, nonce []byte) []byte {
 func NewNonce() ([]byte, error) {
 	n := make([]byte, ChallengeNonceSize)
 	if _, err := rand.Read(n); err != nil {
-		return nil, fmt.Errorf("distributed: nonce generation: %w", err)
+		return nil, fmt.Errorf("onchain: nonce generation: %w", err)
 	}
 	return n, nil
 }
@@ -215,21 +220,19 @@ type ChallengeIssuer struct {
 // VerifyResponse directly), but Challenge() will fail with a clear
 // error in that case.
 //
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  SECURITY NOTE — reduced-security mode.                          ║
-// ║  An issuer built with this constructor has NO local PieceSource, ║
-// ║  so Challenge() cannot cross-check a responder's claimed hash    ║
-// ║  against the actual piece bytes. A malicious replicator that     ║
-// ║  never held the piece can sign a fabricated hash and pass the    ║
-// ║  signature + CID/nonce-binding checks. Acceptable for tests;     ║
-// ║  production wiring MUST use NewChallengeIssuerWithPieceSource.   ║
-// ╚══════════════════════════════════════════════════════════════════╝
+// SECURITY NOTE — reduced-security mode.
+// An issuer built with this constructor has NO local PieceSource,
+// so Challenge() cannot cross-check a responder's claimed hash
+// against the actual piece bytes. A malicious replicator that
+// never held the piece can sign a fabricated hash and pass the
+// signature + CID/nonce-binding checks. Acceptable for tests;
+// production wiring MUST use NewChallengeIssuerWithPieceSource.
 func NewChallengeIssuer(t ChallengeTransport, cfg ChallengeIssuerConfig) (*ChallengeIssuer, error) {
 	return NewChallengeIssuerWithPieceSource(t, nil, cfg)
 }
 
 // NewChallengeIssuerWithPieceSource is the production-grade constructor:
-// pass a PieceSource (typically the local distributed.Store) so the
+// pass a PieceSource (typically the local blob store) so the
 // issuer can verify that the responder's hash matches what a locally
 // held copy of the piece would produce. When the local store does not
 // hold the piece, verification is skipped (Challenge will still verify
@@ -260,13 +263,13 @@ func NewChallengeIssuerWithPieceSource(t ChallengeTransport, pieces PieceSource,
 // the reason ("timeout", "wrong_hash", "sig_fail", "cid_mismatch").
 func (ci *ChallengeIssuer) Challenge(ctx context.Context, peerID, cid string) (ChallengeResult, error) {
 	if ci.transport == nil {
-		return ChallengeResult{}, errors.New("distributed: challenge issuer has no transport")
+		return ChallengeResult{}, errors.New("onchain: challenge issuer has no transport")
 	}
 	if peerID == "" {
-		return ChallengeResult{}, errors.New("distributed: empty peerID")
+		return ChallengeResult{}, errors.New("onchain: empty peerID")
 	}
 	if cid == "" {
-		return ChallengeResult{}, errors.New("distributed: empty cid")
+		return ChallengeResult{}, errors.New("onchain: empty cid")
 	}
 
 	nonce, err := NewNonce()
@@ -281,7 +284,7 @@ func (ci *ChallengeIssuer) Challenge(ctx context.Context, peerID, cid string) (C
 	}
 	payload, err := json.Marshal(&chal)
 	if err != nil {
-		return ChallengeResult{}, fmt.Errorf("distributed: challenge marshal: %w", err)
+		return ChallengeResult{}, fmt.Errorf("onchain: challenge marshal: %w", err)
 	}
 
 	askCtx, cancel := context.WithTimeout(ctx, ci.timeout)
@@ -382,18 +385,18 @@ func (ci *ChallengeIssuer) Challenge(ctx context.Context, peerID, cid string) (C
 // cross-check a claim.
 func (ci *ChallengeIssuer) VerifyResponse(resp *ProofResponse, pieceBytes []byte) error {
 	if resp == nil {
-		return errors.New("distributed: nil response")
+		return errors.New("onchain: nil response")
 	}
 	if len(resp.PubKey) != ed25519.PublicKeySize {
-		return errors.New("distributed: bad pubkey length")
+		return errors.New("onchain: bad pubkey length")
 	}
 	expected := ComputeProofHash(pieceBytes, resp.Nonce)
 	if !bytes.Equal(expected, resp.Hash) {
-		return fmt.Errorf("distributed: hash mismatch: expected %s got %s",
+		return fmt.Errorf("onchain: hash mismatch: expected %s got %s",
 			hex.EncodeToString(expected), hex.EncodeToString(resp.Hash))
 	}
 	if !ed25519.Verify(ed25519.PublicKey(resp.PubKey), signMessage(resp.CID, resp.Nonce, resp.Hash, resp.PubKey), resp.Sig) {
-		return errors.New("distributed: signature verification failed")
+		return errors.New("onchain: signature verification failed")
 	}
 	return nil
 }
@@ -449,7 +452,7 @@ type ChallengeResponder struct {
 }
 
 // PieceSource is the minimum surface the responder needs: fetch the
-// piece's plaintext by CID. Store satisfies this via Get.
+// piece's plaintext by CID. The local blob store satisfies this via Get.
 type PieceSource interface {
 	Get(ctx context.Context, cid string) ([]byte, error)
 	Has(ctx context.Context, cid string) (bool, error)
@@ -460,10 +463,10 @@ type PieceSource interface {
 // TopicBlobChallenge when unset.
 func NewChallengeResponder(store PieceSource, cfg ChallengeResponderConfig) (*ChallengeResponder, error) {
 	if store == nil {
-		return nil, errors.New("distributed: responder needs a non-nil store")
+		return nil, errors.New("onchain: responder needs a non-nil store")
 	}
 	if len(cfg.IdentityKey) != ed25519.PrivateKeySize {
-		return nil, errors.New("distributed: responder needs a valid Ed25519 private key")
+		return nil, errors.New("onchain: responder needs a valid Ed25519 private key")
 	}
 	topic := cfg.Topic
 	if topic == "" {
@@ -489,17 +492,17 @@ func (r *ChallengeResponder) Topic() string { return r.topic }
 // semantics.
 func (r *ChallengeResponder) OnMessage(ctx context.Context, from string, topic string, payload []byte) ([]byte, error) {
 	if topic != r.topic {
-		return nil, fmt.Errorf("distributed: responder topic mismatch: %q", topic)
+		return nil, fmt.Errorf("onchain: responder topic mismatch: %q", topic)
 	}
 	if len(payload) == 0 {
-		return nil, errors.New("distributed: empty challenge payload")
+		return nil, errors.New("onchain: empty challenge payload")
 	}
 	var chal ProofChallenge
 	if err := json.Unmarshal(payload, &chal); err != nil {
-		return nil, fmt.Errorf("distributed: challenge decode: %w", err)
+		return nil, fmt.Errorf("onchain: challenge decode: %w", err)
 	}
 	if chal.CID == "" || len(chal.Nonce) == 0 {
-		return nil, errors.New("distributed: challenge missing fields")
+		return nil, errors.New("onchain: challenge missing fields")
 	}
 
 	// Return early when we don't hold the piece.
@@ -530,7 +533,7 @@ func (r *ChallengeResponder) OnMessage(ctx context.Context, from string, topic s
 
 // BuildResponseFor is a helper exposed for tests / direct use: given a
 // raw piece + nonce + identity key, produce a signed ProofResponse.
-// Mirrors the server-side code path without touching a Store.
+// Mirrors the server-side code path without touching a store.
 func BuildResponseFor(cid string, piece, nonce []byte, identityKey ed25519.PrivateKey) ProofResponse {
 	hash := ComputeProofHash(piece, nonce)
 	pub := identityKey.Public().(ed25519.PublicKey)

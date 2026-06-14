@@ -13,7 +13,7 @@ import (
 // CacheStore abstracts the storage backend for DirectoryCache.
 // Implementations must be safe for concurrent use only if they will be used
 // without the DirectoryCache mutex. The default MemoryCacheStore does NOT
-// use its own locking — DirectoryCache's c.mu is authoritative.
+// use its own locking — DirectoryCache's c.inMemMu is authoritative.
 type CacheStore interface {
 	// Members
 	GetMember(tenant, nodeID string) (lad.MemberRecord, bool)

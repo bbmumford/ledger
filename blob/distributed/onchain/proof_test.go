@@ -3,18 +3,35 @@
  * Queries: licensing@hstles.com
  */
 
-package distributed
+package onchain
 
 import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/blake2b"
 )
+
+// ErrBlobNotFound is the sentinel the test PieceSource returns when a CID
+// is not held. The on-chain package itself does not need this sentinel
+// (the responder treats any Has/Get error as "not held"); it lives here
+// solely so the test fixtures can mirror what a real store would do.
+var errBlobNotFound = errors.New("test: blob not found")
+
+// computePieceCID computes the same content-address the production blob
+// store uses (BLAKE2b-256 hex). Kept local to tests since the on-chain
+// package has no dependency on the wider blob store.
+func computePieceCID(piece []byte) string {
+	sum := blake2b.Sum256(piece)
+	return hex.EncodeToString(sum[:])
+}
 
 // fakePieceSource is an in-memory PieceSource for responder tests.
 type fakePieceSource struct {
@@ -24,7 +41,7 @@ type fakePieceSource struct {
 func (f *fakePieceSource) Get(_ context.Context, cid string) ([]byte, error) {
 	p, ok := f.pieces[cid]
 	if !ok {
-		return nil, ErrBlobNotFound
+		return nil, errBlobNotFound
 	}
 	return p, nil
 }
@@ -289,12 +306,13 @@ func TestChallenge_RecentResultsRing(t *testing.T) {
 	}
 }
 
-// TestChallenge_IssuerRejectsSignedButFabricatedHash covers the Fix-3
-// attack: a peer with a valid Ed25519 identity key signs a hash
-// computed over bytes it never actually held. Without the PieceSource
-// cross-check the issuer would accept the response (signature is good,
-// CID + nonce bind correctly). With the cross-check the issuer refuses
-// because the claimed hash does not match its local copy.
+// TestChallenge_IssuerRejectsSignedButFabricatedHash covers the
+// fabricated-hash attack: a peer with a valid Ed25519 identity key signs
+// a hash computed over bytes it never actually held. Without the
+// PieceSource cross-check the issuer would accept the response
+// (signature is good, CID + nonce bind correctly). With the cross-check
+// the issuer refuses because the claimed hash does not match its local
+// copy.
 func TestChallenge_IssuerRejectsSignedButFabricatedHash(t *testing.T) {
 	realPiece := []byte("the real piece that the issuer actually holds")
 	cid := computePieceCID(realPiece)
@@ -370,8 +388,5 @@ func TestResponder_WrongTopicRejected(t *testing.T) {
 	_, err := responder.OnMessage(context.Background(), "x", "plutus.blob.find", []byte("{}"))
 	if err == nil {
 		t.Fatalf("expected error on wrong topic")
-	}
-	if !errors.Is(err, err) { // sanity: error is set
-		t.Fatalf("expected non-nil error sentinel")
 	}
 }

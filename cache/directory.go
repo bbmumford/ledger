@@ -70,9 +70,21 @@ type CacheStatsReport struct {
 }
 
 // DirectoryCache maintains a materialised view of ledger data for quick lookups.
+//
+// Lock split: inMemMu guards every in-memory map / projection / subscriber
+// list on this struct. persistMu serialises long-running persistence ops
+// (SQL writes against a future SQL-backed CacheStore, etc.) so a slow
+// Turso/disk round-trip cannot block in-memory readers behind it. Callers
+// that touch persistent storage must acquire persistMu first, then
+// momentarily acquire inMemMu only for the read-snapshot / write-back
+// phases — never hold inMemMu across the persistent I/O call itself.
+// MemoryCacheStore (current default) does no I/O, so persistMu is unused
+// on that path; it's wired so a SQL CacheStore can plug in without
+// reintroducing the original c.mu contention.
 type DirectoryCache struct {
-	mu    sync.RWMutex
-	store CacheStore
+	inMemMu   sync.RWMutex
+	persistMu sync.Mutex
+	store     CacheStore
 
 	// dumpSigningKey signs records rebuilt from typed projections in
 	// Dump() / DumpSince() so the gossip emit path produces wire records
@@ -90,7 +102,7 @@ type DirectoryCache struct {
 	// tombstone that later suppresses its own re-announcement. Empty
 	// string disables the exemption (backward compatible for tests
 	// and consumers that don't set it). Set-once at startup, then
-	// read lock-free under c.mu's existing read paths in eviction.
+	// read lock-free under c.inMemMu's existing read paths in eviction.
 	localNodeID string
 
 	// gossipLivenessOverrides records nodeIDs whose member/reach
@@ -114,7 +126,7 @@ type DirectoryCache struct {
 	//
 	// Map presence == override active; the boolean value is reserved
 	// for future use (e.g. a "definitely dead, evict eagerly" mode).
-	// Lock discipline: read+write under c.mu, same as every other
+	// Lock discipline: read+write under c.inMemMu, same as every other
 	// map on this struct.
 	gossipLivenessOverrides map[string]bool
 
@@ -130,7 +142,7 @@ type DirectoryCache struct {
 
 	// lamportClock — local Lamport timestamp. Atomic so the
 	// max-then-increment dance on every Apply call does not require
-	// c.mu, which would block every concurrent reader (cache.Roles,
+	// c.inMemMu, which would block every concurrent reader (cache.Roles,
 	// cache.Members, cache.Reach) on the cache write lock for the
 	// duration of an Ed25519 signature verify in the ACL hook. The
 	// updateLamport helper is the only writer.
@@ -207,15 +219,15 @@ type ReachDeltaApplier func(baseBody, deltaBody []byte) (newBody []byte, err err
 // SetReachDeltaApplier installs (or clears) the delta applier. Safe to call
 // at any time; the next delta apply uses the new applier.
 func (c *DirectoryCache) SetReachDeltaApplier(a ReachDeltaApplier) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	c.reachDeltaApplier = a
 }
 
 // RegisterMerge sets the merge function for a topic.
 func (c *DirectoryCache) RegisterMerge(topic lad.Topic, fn lad.MergeFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.mergeFuncs == nil {
 		c.mergeFuncs = make(map[lad.Topic]lad.MergeFunc)
 	}
@@ -224,8 +236,8 @@ func (c *DirectoryCache) RegisterMerge(topic lad.Topic, fn lad.MergeFunc) {
 
 // RegisterKey sets the key derivation function for a topic.
 func (c *DirectoryCache) RegisterKey(topic lad.Topic, fn lad.KeyFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.keyFuncs == nil {
 		c.keyFuncs = make(map[lad.Topic]lad.KeyFunc)
 	}
@@ -234,8 +246,8 @@ func (c *DirectoryCache) RegisterKey(topic lad.Topic, fn lad.KeyFunc) {
 
 // RegisterTopic registers a full topic configuration.
 func (c *DirectoryCache) RegisterTopic(topic lad.Topic, cfg lad.TopicConfig) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.topicCfgs == nil {
 		c.topicCfgs = make(map[lad.Topic]lad.TopicConfig)
 	}
@@ -256,8 +268,8 @@ func (c *DirectoryCache) RegisterTopic(topic lad.Topic, cfg lad.TopicConfig) {
 
 // SetMetrics sets the metrics recorder for observability.
 func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	c.metrics = m
 }
 
@@ -273,23 +285,23 @@ func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
 // turning the node invisible to the rest of the mesh (the exact
 // symptom behind 94-tombstones-vs-2-members).
 func (c *DirectoryCache) SetLocalNodeID(nodeID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	c.localNodeID = nodeID
 }
 
 // LocalNodeID returns the currently-registered local node identifier
 // (empty if unset).
 func (c *DirectoryCache) LocalNodeID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	return c.localNodeID
 }
 
 // Subscribe registers a callback for record changes on a topic.
 func (c *DirectoryCache) Subscribe(topic lad.Topic, handler func(lad.Record)) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.subscribers == nil {
 		c.subscribers = make(map[lad.Topic][]func(lad.Record))
 	}
@@ -319,8 +331,8 @@ func (c *DirectoryCache) keyFunc(topic lad.Topic) lad.KeyFunc {
 // RegisterACL sets the ACL check function for a topic.
 // The function is called in Apply() before merge; return an error to reject the record.
 func (c *DirectoryCache) RegisterACL(topic lad.Topic, fn lad.ACLFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.aclFuncs == nil {
 		c.aclFuncs = make(map[lad.Topic]lad.ACLFunc)
 	}
@@ -330,8 +342,8 @@ func (c *DirectoryCache) RegisterACL(topic lad.Topic, fn lad.ACLFunc) {
 // RegisterIndex adds a secondary index for a topic. The IndexFunc is called on
 // every Apply to derive zero or more index keys that map back to the record.
 func (c *DirectoryCache) RegisterIndex(topic lad.Topic, name string, fn lad.IndexFunc) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.indexFuncs == nil {
 		c.indexFuncs = make(map[lad.Topic]map[string]lad.IndexFunc)
 	}
@@ -353,8 +365,8 @@ func (c *DirectoryCache) RegisterIndex(topic lad.Topic, name string, fn lad.Inde
 
 // QueryByIndex returns all records matching a secondary index key.
 func (c *DirectoryCache) QueryByIndex(topic lad.Topic, indexName string, key string) ([]lad.Record, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	if c.indexes == nil {
 		return nil, errors.New("ledger: no indexes registered")
 	}
@@ -375,8 +387,8 @@ func (c *DirectoryCache) QueryByIndex(topic lad.Topic, indexName string, key str
 
 // RegisterCompaction sets the compaction policy for a topic.
 func (c *DirectoryCache) RegisterCompaction(topic lad.Topic, policy lad.CompactionPolicy) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.compaction == nil {
 		c.compaction = make(map[lad.Topic]lad.CompactionPolicy)
 	}
@@ -386,8 +398,8 @@ func (c *DirectoryCache) RegisterCompaction(topic lad.Topic, policy lad.Compacti
 // Compact removes tombstones older than MaxTombstoneAge for the given topic.
 // Returns the number of records removed.
 func (c *DirectoryCache) Compact(topic lad.Topic) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	policy, ok := c.compaction[topic]
 	if !ok {
@@ -417,12 +429,12 @@ func (c *DirectoryCache) Compact(topic lad.Topic) (int, error) {
 // CompactAll runs compaction across all topics with registered policies.
 // Returns the total number of records removed.
 func (c *DirectoryCache) CompactAll() (int, error) {
-	c.mu.RLock()
+	c.inMemMu.RLock()
 	topics := make([]lad.Topic, 0, len(c.compaction))
 	for t := range c.compaction {
 		topics = append(topics, t)
 	}
-	c.mu.RUnlock()
+	c.inMemMu.RUnlock()
 
 	total := 0
 	for _, t := range topics {
@@ -438,8 +450,8 @@ func (c *DirectoryCache) CompactAll() (int, error) {
 // SetConflictLogging enables or disables conflict logging with the given capacity.
 // When enabled, merge conflicts in Apply() are recorded for later inspection.
 func (c *DirectoryCache) SetConflictLogging(enabled bool, maxEntries int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if enabled {
 		if c.conflictLog == nil {
 			c.conflictLog = lad.NewConflictLog(maxEntries)
@@ -455,9 +467,9 @@ func (c *DirectoryCache) SetConflictLogging(enabled bool, maxEntries int) {
 
 // ConflictEntries returns recent conflict records for a topic.
 func (c *DirectoryCache) ConflictEntries(topic lad.Topic, limit int) []lad.ConflictRecord {
-	c.mu.RLock()
+	c.inMemMu.RLock()
 	cl := c.conflictLog
-	c.mu.RUnlock()
+	c.inMemMu.RUnlock()
 	if cl == nil {
 		return nil
 	}
@@ -473,8 +485,8 @@ func (c *DirectoryCache) BloomFilter(topic lad.Topic) interface{} {
 // HasRecord returns true if a record exists for the given topic and key.
 // Key semantics depend on the topic (NodeID for members/roles/reach, composite for latency).
 func (c *DirectoryCache) HasRecord(topic lad.Topic, key string) bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	switch topic {
 	case lad.TopicMember:
@@ -545,9 +557,9 @@ func (c *DirectoryCache) Store() CacheStore {
 // at runtime startup with the local node's identity key so gossiped
 // records carry valid lad envelope signatures.
 func (c *DirectoryCache) SetDumpSigningKey(priv ed25519.PrivateKey) {
-	c.mu.Lock()
+	c.inMemMu.Lock()
 	c.dumpSigningKey = priv
-	c.mu.Unlock()
+	c.inMemMu.Unlock()
 }
 
 // RecordGossipSeen marks a nodeID as alive (seen in gossip exchange).
@@ -555,9 +567,9 @@ func (c *DirectoryCache) RecordGossipSeen(nodeID string) {
 	if nodeID == "" {
 		return
 	}
-	c.mu.Lock()
+	c.inMemMu.Lock()
 	c.store.PutGossipSeen(nodeID, time.Now())
-	c.mu.Unlock()
+	c.inMemMu.Unlock()
 }
 
 // SetGossipLivenessOverride installs (alive=true) or clears
@@ -584,8 +596,8 @@ func (c *DirectoryCache) SetGossipLivenessOverride(nodeID string, alive bool) {
 	if nodeID == "" {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if alive {
 		if c.gossipLivenessOverrides == nil {
 			c.gossipLivenessOverrides = make(map[string]bool)
@@ -599,7 +611,7 @@ func (c *DirectoryCache) SetGossipLivenessOverride(nodeID string, alive bool) {
 }
 
 // hasLivenessOverride is the read-side companion to
-// SetGossipLivenessOverride. Caller must hold c.mu.
+// SetGossipLivenessOverride. Caller must hold c.inMemMu.
 func (c *DirectoryCache) hasLivenessOverride(nodeID string) bool {
 	if c.gossipLivenessOverrides == nil {
 		return false
@@ -609,23 +621,23 @@ func (c *DirectoryCache) hasLivenessOverride(nodeID string) bool {
 
 // LastGossipSeen returns when a nodeID was last seen in gossip (zero if never).
 func (c *DirectoryCache) LastGossipSeen(nodeID string) time.Time {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	t, _ := c.store.GetGossipSeen(nodeID)
 	return t
 }
 
 // GossipLiveness returns all gossip liveness entries.
 func (c *DirectoryCache) GossipLiveness() map[string]time.Time {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	return c.store.AllGossipSeen()
 }
 
 // CacheStats returns observability metrics about the current cache state.
 func (c *DirectoryCache) CacheStats() CacheStatsReport {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	var stats CacheStatsReport
 	allMembers := c.store.AllMembers()
@@ -696,7 +708,7 @@ func tombstoneKey(topic lad.Topic, tenantID, nodeID string) string {
 //   - "explicit" / "cap" — propagated via gossip to all peers (prevents re-propagation)
 //   - "liveness" — local-only, NOT propagated (prevents cascade eviction across mesh)
 //
-// Must be called with c.mu held.
+// Must be called with c.inMemMu held.
 func (c *DirectoryCache) emitTombstone(topic lad.Topic, tenantID, nodeID, reason string) {
 	now := time.Now()
 	key := tombstoneKey(topic, tenantID, nodeID)
@@ -721,8 +733,8 @@ func (c *DirectoryCache) emitTombstone(topic lad.Topic, tenantID, nodeID, reason
 // EvictNode removes all records for a specific node and emits propagating
 // tombstones. Used during graceful shutdown to announce departure.
 func (c *DirectoryCache) EvictNode(nodeID string, reason string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	// Find and remove from all tenant maps
 	for tenant := range c.store.AllMembers() {
@@ -776,8 +788,8 @@ func (c *DirectoryCache) EvictPeer(nodeID, reason string) {
 // Caps are enforced on latency (maxLatencyRecords) and per-tenant maps (maxRecordsPerTenant).
 func (c *DirectoryCache) EvictExpired() int {
 	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	removedMembers := 0
 	removedReach := 0
@@ -1051,26 +1063,26 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	// rapid restart scenarios where a node shuts down and comes back within the same second.
 	// Local-only tombstones ("liveness-local") never block — they're just cache cleanup markers.
 	tKey := tombstoneKey(rec.Topic, rec.TenantID, rec.NodeID)
-	c.mu.RLock()
+	c.inMemMu.RLock()
 	if ts, ok := c.store.GetTombstone(tKey); ok {
 		if ts.TombstoneReason == "liveness-local" {
 			// Local-only tombstone — always allow new records (node may have restarted)
-			c.mu.RUnlock()
+			c.inMemMu.RUnlock()
 		} else if rec.Seq > 0 && !rec.Timestamp.Before(ts.DeletedAt) {
 			// Record has a sequence number and is at least as new as the tombstone.
 			// This is a live node re-registering after restart — allow it and clear tombstone.
-			c.mu.RUnlock()
-			c.mu.Lock()
+			c.inMemMu.RUnlock()
+			c.inMemMu.Lock()
 			c.store.DeleteTombstone(tKey)
-			c.mu.Unlock()
+			c.inMemMu.Unlock()
 		} else if ts.DeletedAt.After(rec.Timestamp) {
-			c.mu.RUnlock()
+			c.inMemMu.RUnlock()
 			return nil // tombstone is strictly newer — reject stale record
 		} else {
-			c.mu.RUnlock()
+			c.inMemMu.RUnlock()
 		}
 	} else {
-		c.mu.RUnlock()
+		c.inMemMu.RUnlock()
 	}
 
 	// ACL check — reject record before merge if topic has an ACL function.
@@ -1094,9 +1106,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 		if err != nil {
 			return err
 		}
-		c.mu.RLock()
+		c.inMemMu.RLock()
 		_, exists := c.store.GetMember(member.TenantID, member.NodeID)
-		c.mu.RUnlock()
+		c.inMemMu.RUnlock()
 		isNew = !exists
 		isMemberChange = isNew
 		c.storeMember(member)
@@ -1105,9 +1117,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 		if err != nil {
 			return err
 		}
-		c.mu.RLock()
+		c.inMemMu.RLock()
 		_, exists := c.store.GetRole(role.TenantID, role.NodeID)
-		c.mu.RUnlock()
+		c.inMemMu.RUnlock()
 		isNew = !exists
 		c.storeRole(role)
 	case lad.TopicReach:
@@ -1122,14 +1134,14 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			// registered AND we hold a base full snapshot, rebuild a full
 			// record from (base + ops) and store that. Otherwise skip and
 			// wait for the next full snapshot to refresh.
-			c.mu.RLock()
+			c.inMemMu.RLock()
 			applier := c.reachDeltaApplier
 			var baseBody []byte
 			if tenantMap, ok := c.lastReachBody[peek.TenantID]; ok {
 				baseBody = tenantMap[peek.NodeID]
 			}
 			_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
-			c.mu.RUnlock()
+			c.inMemMu.RUnlock()
 			if applier == nil || baseBody == nil {
 				return nil
 			}
@@ -1154,9 +1166,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 		// Full snapshot path.
 		peek.UpdatedAt = rec.Timestamp
 		peek.Seq = rec.Seq
-		c.mu.RLock()
+		c.inMemMu.RLock()
 		_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
-		c.mu.RUnlock()
+		c.inMemMu.RUnlock()
 		isNew = !exists
 		c.storeReach(peek)
 		c.setLastReachBody(peek.TenantID, peek.NodeID, rec.Body)
@@ -1166,9 +1178,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			return err
 		}
 		key := lat.FromNode + "::" + lat.ToNode + "::" + lat.Transport
-		c.mu.RLock()
+		c.inMemMu.RLock()
 		_, exists := c.store.GetLatency(key)
-		c.mu.RUnlock()
+		c.inMemMu.RUnlock()
 		isNew = !exists
 		c.storeLatency(lat)
 	default:
@@ -1191,7 +1203,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	// Update secondary indexes for this record.
 	if c.indexFuncs != nil {
 		if topicFuncs, ok := c.indexFuncs[rec.Topic]; ok {
-			c.mu.Lock()
+			c.inMemMu.Lock()
 			for idxName, idxFn := range topicFuncs {
 				keys := idxFn(rec)
 				for _, k := range keys {
@@ -1204,7 +1216,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 					c.indexes[rec.Topic][idxName][k] = append(c.indexes[rec.Topic][idxName][k], rec)
 				}
 			}
-			c.mu.Unlock()
+			c.inMemMu.Unlock()
 		}
 	}
 
@@ -1223,9 +1235,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	}
 
 	// Notify topic subscribers (used by SubscribeWithReplay for live changes).
-	c.mu.RLock()
+	c.inMemMu.RLock()
 	subs := c.subscribers[rec.Topic]
-	c.mu.RUnlock()
+	c.inMemMu.RUnlock()
 	for _, fn := range subs {
 		fn(rec)
 	}
@@ -1241,8 +1253,8 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 // applyTombstone processes a tombstone record: removes matching data from cache
 // and stores the tombstone for re-propagation to peers.
 func (c *DirectoryCache) applyTombstone(rec lad.Record) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	tKey := tombstoneKey(rec.Topic, rec.TenantID, rec.NodeID)
 
@@ -1281,7 +1293,7 @@ func (c *DirectoryCache) CurrentLamportClock() uint64 {
 
 // updateLamport applies the standard Lamport update: max(local, received) + 1.
 // CAS-loops over the atomic so concurrent Apply calls converge without
-// holding c.mu. A duplicate Apply on the same record may bump the clock
+// holding c.inMemMu. A duplicate Apply on the same record may bump the clock
 // twice, which is harmless: Lamport just needs monotonicity, not
 // uniqueness.
 func (c *DirectoryCache) updateLamport(received uint64) {
@@ -1298,8 +1310,8 @@ func (c *DirectoryCache) updateLamport(received uint64) {
 }
 
 func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	// Newer-wins with generic attr merging: preserve all non-empty attrs from the richer record.
 	if existing, ok := c.store.GetMember(member.TenantID, member.NodeID); ok {
@@ -1336,8 +1348,8 @@ func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
 }
 
 func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	c.store.PutRole(role.TenantID, role)
 }
 
@@ -1348,8 +1360,8 @@ func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
 //
 // The returned slice is a private copy; callers may mutate it freely.
 func (c *DirectoryCache) GetLastReachBody(tenant, nodeID string) []byte {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	tm, ok := c.lastReachBody[tenant]
 	if !ok {
 		return nil
@@ -1365,13 +1377,13 @@ func (c *DirectoryCache) GetLastReachBody(tenant, nodeID string) []byte {
 
 // setLastReachBody stores the raw body of the most recent full-snapshot
 // ReachRecord for (tenant, nodeID) so delta applies have a base to rebuild
-// from. Caller must not hold c.mu.
+// from. Caller must not hold c.inMemMu.
 func (c *DirectoryCache) setLastReachBody(tenant, nodeID string, body []byte) {
 	if len(body) == 0 {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.lastReachBody == nil {
 		c.lastReachBody = make(map[string]map[string][]byte)
 	}
@@ -1390,8 +1402,8 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 	if !reach.ExpiresAt.IsZero() && reach.ExpiresAt.Before(time.Now()) {
 		return // already expired
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	// If a record already exists for this NodeID, only replace it if the
 	// incoming record is newer (higher Seq or later UpdatedAt). This
@@ -1428,8 +1440,8 @@ func (c *DirectoryCache) Members(ctx context.Context, tenant string) ([]lad.Memb
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	persisted := c.store.ListMembers(tenant)
 	seen := make(map[string]struct{}, len(persisted))
 	for _, m := range persisted {
@@ -1464,8 +1476,8 @@ func (c *DirectoryCache) Roles(ctx context.Context, tenant string, query RoleQue
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	entries := c.store.ListRoles(tenant)
 	result := make([]lad.RoleRecord, 0)
 	for _, role := range entries {
@@ -1489,8 +1501,8 @@ func (c *DirectoryCache) Reach(ctx context.Context, tenant string, query ReachQu
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	entries := c.store.ListReach(tenant)
 	if len(entries) == 0 {
 		return nil, nil
@@ -1621,8 +1633,8 @@ func (c *DirectoryCache) QueryHandlerMetadata(ctx context.Context, tenant, handl
 	}
 	role := parts[0]
 
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	// Search role records for nodes with this role
 	entries := c.store.ListRoles(tenant)
@@ -1652,7 +1664,7 @@ func (c *DirectoryCache) QueryHandlerMetadata(ctx context.Context, tenant, handl
 // evictLatencyForNode removes all latency records involving the given node
 // (as either source or destination). Called when a member is liveness-evicted
 // to proactively free memory instead of waiting for the 10-minute TTL.
-// Caller must NOT hold c.mu (this method is called from EvictExpired which holds it).
+// Caller must NOT hold c.inMemMu (this method is called from EvictExpired which holds it).
 func (c *DirectoryCache) evictLatencyForNode(nodeID string) int {
 	removed := 0
 	allLatency := c.store.AllLatency()
@@ -1669,8 +1681,8 @@ func (c *DirectoryCache) storeLatency(lat lad.LatencyRecord) {
 	if !lat.ExpiresAt.IsZero() && lat.ExpiresAt.Before(time.Now()) {
 		return // already expired
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	// Composite key: each transport gets its own latency record per node pair.
 	// This prevents TLS and WebSocket from overwriting each other.
 	key := lat.FromNode + "::" + lat.ToNode + "::" + lat.Transport
@@ -1686,8 +1698,8 @@ func (c *DirectoryCache) storeLatency(lat lad.LatencyRecord) {
 // Latency returns all non-expired latency records.
 // If fromNode is non-empty, only returns measurements from that node.
 func (c *DirectoryCache) Latency(fromNode string) []lad.LatencyRecord {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	now := time.Now()
 	allLatency := c.store.AllLatency()
 	var result []lad.LatencyRecord
@@ -1706,8 +1718,8 @@ func (c *DirectoryCache) Latency(fromNode string) []lad.LatencyRecord {
 // LatencyBetween returns the best (lowest) measured RTT between two nodes.
 // Checks all transport variants for this node pair.
 func (c *DirectoryCache) LatencyBetween(fromNode, toNode string) time.Duration {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	prefix := fromNode + "::" + toNode + "::"
 	now := time.Now()
 	var best time.Duration
@@ -1729,8 +1741,8 @@ func (c *DirectoryCache) LatencyBetween(fromNode, toNode string) time.Duration {
 // DumpSince returns records with Timestamp strictly after since.
 // Used by delta gossip sync to send only changed records.
 func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	var records []lad.Record
 	now := time.Now()
@@ -1843,8 +1855,8 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 // ChangesSince returns the number of records with Timestamp after the given time.
 // Used by adaptive gossip interval (Phase E1) to measure cache change rate.
 func (c *DirectoryCache) ChangesSince(since time.Time) int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	count := 0
 	for _, members := range c.store.AllMembers() {
@@ -1878,8 +1890,8 @@ func (c *DirectoryCache) ChangesSince(since time.Time) int {
 
 // Dump returns all records in the cache as a flat list.
 func (c *DirectoryCache) Dump() []lad.Record {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	// Pre-allocate based on estimated counts to avoid repeated slice growth.
 	// Use cheap count methods where available; estimate the rest conservatively.
@@ -1976,8 +1988,8 @@ func (c *DirectoryCache) Dump() []lad.Record {
 // Used for cache reconciliation: two caches with identical keys produce the
 // same fingerprint. Different fingerprints indicate divergence.
 func (c *DirectoryCache) Fingerprint() uint64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	var fp uint64
 
@@ -2019,8 +2031,8 @@ func hashKey(s string) uint64 {
 // Implements ledger.ExpirySource.
 func (c *DirectoryCache) PruneExpired() (int, error) {
 	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 
 	removed := 0
 
@@ -2073,8 +2085,8 @@ func (c *DirectoryCache) PruneExpired() (int, error) {
 // ChangesSinceHLC returns all records for a topic with timestamp (as UnixNano) > since.
 // Records are returned sorted by timestamp ascending for deterministic replay.
 func (c *DirectoryCache) ChangesSinceHLC(topic lad.Topic, since uint64) ([]lad.Record, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 
 	var records []lad.Record
 
@@ -2182,8 +2194,8 @@ func (c *DirectoryCache) updateIdentityView(rec lad.Record) {
 	if rec.NodeID == "" {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
 	if c.identityViews == nil {
 		c.identityViews = make(map[string]map[string]lad.IdentityView)
 	}
@@ -2214,8 +2226,8 @@ func (c *DirectoryCache) updateIdentityView(rec lad.Record) {
 // IBLT input. Order is unstable; callers that need a stable order
 // (the IBLT driver, for instance) should sort by content hash.
 func (c *DirectoryCache) IdentityViews() []lad.IdentityView {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	if len(c.identityViews) == 0 {
 		return nil
 	}
@@ -2231,8 +2243,8 @@ func (c *DirectoryCache) IdentityViews() []lad.IdentityView {
 // IdentityView returns the projection entry for a specific
 // (NodeID, Topic) pair, or zero-value + false if absent.
 func (c *DirectoryCache) IdentityView(nodeID, topic string) (lad.IdentityView, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
 	if topicMap, ok := c.identityViews[nodeID]; ok {
 		v, found := topicMap[topic]
 		return v, found

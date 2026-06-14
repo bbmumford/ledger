@@ -11,7 +11,7 @@ import (
 )
 
 // MemoryCacheStore implements CacheStore using in-memory maps.
-// It does NOT use its own locking — DirectoryCache's c.mu is authoritative.
+// It does NOT use its own locking — DirectoryCache's c.inMemMu is authoritative.
 type MemoryCacheStore struct {
 	// Exported for DirectoryCache backward-compatibility with tests that
 	// access the maps directly via the DirectoryCache struct fields.
