@@ -2015,6 +2015,60 @@ func (c *DirectoryCache) Fingerprint() uint64 {
 	return fp
 }
 
+// maxBucketDigest bounds the number of buckets BucketDigest will produce, so a
+// caller cannot demand an unbounded digest vector. Matches whisper's
+// maxDigestBuckets — the wire frame that carries it caps at the same value.
+const maxBucketDigest uint16 = 256
+
+// BucketDigest partitions the same key set Fingerprint hashes into `buckets`
+// buckets and returns a per-bucket XOR digest: out[i] = XOR of hashKey(key)
+// over every key whose hashKey(key) % buckets == i.
+//
+// Invariant: XOR(out[0..buckets-1]) == Fingerprint() — same keys, same hash,
+// just partitioned. So a scalar Fingerprint mismatch (the cheap first probe)
+// can be localised to the diverging buckets, and a reconcile transfers only
+// those buckets' records instead of the whole cache. buckets is clamped to
+// [1, maxBucketDigest]. Runs the exact four loops Fingerprint runs, under the
+// same read lock; intended for the gossip mismatch branch only.
+func (c *DirectoryCache) BucketDigest(buckets uint16) []uint64 {
+	if buckets == 0 {
+		buckets = 1
+	}
+	if buckets > maxBucketDigest {
+		buckets = maxBucketDigest
+	}
+	n := uint64(buckets)
+	out := make([]uint64, buckets)
+
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
+
+	for tenant, members := range c.store.AllMembers() {
+		for _, m := range members {
+			h := hashKey(fmt.Sprintf("member:%s:%s", tenant, m.NodeID))
+			out[h%n] ^= h
+		}
+	}
+	for tenant, roles := range c.store.AllRoles() {
+		for _, r := range roles {
+			h := hashKey(fmt.Sprintf("role:%s:%s", tenant, r.NodeID))
+			out[h%n] ^= h
+		}
+	}
+	for tenant, reachRecords := range c.store.AllReach() {
+		for _, r := range reachRecords {
+			h := hashKey(fmt.Sprintf("reach:%s:%s", tenant, r.NodeID))
+			out[h%n] ^= h
+		}
+	}
+	for key := range c.store.AllLatency() {
+		h := hashKey("latency:" + key)
+		out[h%n] ^= h
+	}
+
+	return out
+}
+
 // hashKey returns the FNV-1a 64-bit hash of a string.
 func hashKey(s string) uint64 {
 	h := fnv.New64a()
