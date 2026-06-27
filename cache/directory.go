@@ -2069,6 +2069,93 @@ func (c *DirectoryCache) BucketDigest(buckets uint16) []uint64 {
 	return out
 }
 
+// DumpBuckets returns the gossipable records whose key falls in one of the
+// wanted buckets — the bucket-scoped counterpart of Dump, for the follow-up to
+// a bucketed-digest mismatch. want[i]==true selects bucket i; the bucket of a
+// record is hashKey(key) % buckets over the SAME key strings BucketDigest /
+// Fingerprint hash, so the diverging-bucket set computed from two BucketDigest
+// vectors selects exactly the records that may differ. buckets is clamped to
+// [1, maxBucketDigest] (must match the BucketDigest call that produced `want`).
+//
+// Only the bucketed key set (members, roles, reach, latency) is covered;
+// tombstones are not part of the digest and ride the periodic full Dump, so
+// they are intentionally excluded here.
+func (c *DirectoryCache) DumpBuckets(buckets uint16, want []bool) []lad.Record {
+	if buckets == 0 {
+		buckets = 1
+	}
+	if buckets > maxBucketDigest {
+		buckets = maxBucketDigest
+	}
+	n := uint64(buckets)
+	wanted := func(key string) bool {
+		b := int(hashKey(key) % n)
+		return b < len(want) && want[b]
+	}
+
+	c.inMemMu.RLock()
+	defer c.inMemMu.RUnlock()
+
+	signingKey := c.dumpSigningKey
+	signEnvelope := func(rec *lad.Record) {
+		if signingKey != nil {
+			lad.SignRecord(rec, signingKey)
+		}
+	}
+
+	var records []lad.Record
+	now := time.Now()
+
+	for tenant, members := range c.store.AllMembers() {
+		for _, m := range members {
+			if !wanted(fmt.Sprintf("member:%s:%s", tenant, m.NodeID)) {
+				continue
+			}
+			body, _ := json.Marshal(m)
+			rec := lad.Record{Topic: lad.TopicMember, TenantID: m.TenantID, NodeID: m.NodeID, Body: body, Timestamp: m.CreatedAt}
+			signEnvelope(&rec)
+			records = append(records, rec)
+		}
+	}
+	for tenant, roles := range c.store.AllRoles() {
+		for _, r := range roles {
+			if !wanted(fmt.Sprintf("role:%s:%s", tenant, r.NodeID)) {
+				continue
+			}
+			body, _ := json.Marshal(r)
+			rec := lad.Record{Topic: lad.TopicRole, TenantID: r.TenantID, NodeID: r.NodeID, Body: body, Timestamp: r.Updated}
+			signEnvelope(&rec)
+			records = append(records, rec)
+		}
+	}
+	for tenant, reachRecords := range c.store.AllReach() {
+		for _, r := range reachRecords {
+			if !r.ExpiresAt.IsZero() && r.ExpiresAt.Before(now) {
+				continue
+			}
+			if !wanted(fmt.Sprintf("reach:%s:%s", tenant, r.NodeID)) {
+				continue
+			}
+			body, _ := json.Marshal(r)
+			rec := lad.Record{Topic: lad.TopicReach, TenantID: r.TenantID, NodeID: r.NodeID, Seq: r.Seq, Body: body, Timestamp: r.UpdatedAt}
+			signEnvelope(&rec)
+			records = append(records, rec)
+		}
+	}
+	for key, lat := range c.store.AllLatency() {
+		if !lat.ExpiresAt.IsZero() && lat.ExpiresAt.Before(now) {
+			continue
+		}
+		if !wanted("latency:" + key) {
+			continue
+		}
+		body, _ := json.Marshal(lat)
+		records = append(records, lad.Record{Topic: lad.TopicLatency, NodeID: lat.FromNode, Body: body, Timestamp: lat.MeasuredAt})
+	}
+
+	return records
+}
+
 // hashKey returns the FNV-1a 64-bit hash of a string.
 func hashKey(s string) uint64 {
 	h := fnv.New64a()
