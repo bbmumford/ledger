@@ -169,6 +169,25 @@ type DirectoryCache struct {
 	metrics    lad.MetricsRecorder
 	subscribers map[lad.Topic][]func(lad.Record)
 
+	// onLivenessEvict, when set, is invoked for each node the liveness
+	// sweep declares dead — AFTER the local eviction, outside inMemMu.
+	//
+	// The sweep's verdict is otherwise trapped in this process: emitTombstone
+	// downgrades reason "liveness" to "liveness-local" precisely so it is NOT
+	// gossiped (a node that blips must never be cascade-evicted fleet-wide).
+	// The cost of that safety is that a genuinely dead node is never
+	// COLLECTIVELY forgotten — every peer evicts on its own independent
+	// clock, and any peer whose clock has not fired re-gossips the corpse
+	// straight back. The record ping-pongs forever.
+	//
+	// This hook exports the verdict without exporting the authority: the
+	// cache says "I observed this node dead", and the transport layer decides
+	// whether that observation is worth attesting to (HSTLES publishes a
+	// swarm observer-tombstone, which only becomes a propagating death once
+	// K distinct anchors independently agree). Safety stays with the quorum;
+	// the cache never gains the power to evict a peer fleet-wide on its own.
+	onLivenessEvict func(nodeID string)
+
 	// ACL, indexing, compaction, and conflict logging.
 	conflictLog *lad.ConflictLog
 	aclFuncs    map[lad.Topic]lad.ACLFunc
@@ -284,6 +303,25 @@ func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
 // a tombstone that propagates, suppressing later re-announcements and
 // turning the node invisible to the rest of the mesh (the exact
 // symptom behind 94-tombstones-vs-2-members).
+// SetOnLivenessEvict registers a callback invoked once per node the liveness
+// sweep declares dead. It fires AFTER the local eviction and OUTSIDE inMemMu,
+// so the callback may take its own locks or publish to a transport without
+// deadlocking against the cache.
+//
+// The callback receives an OBSERVATION, not an instruction: "this node has
+// been silent past the liveness timeout, as seen from here". It must not treat
+// that as authority to evict the node anywhere else — a single node's view is
+// exactly what the local-only tombstone design refuses to trust. HSTLES turns
+// it into a swarm observer attestation, which becomes a real propagating death
+// only once K distinct anchors independently agree.
+//
+// Pass nil to clear.
+func (c *DirectoryCache) SetOnLivenessEvict(fn func(nodeID string)) {
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
+	c.onLivenessEvict = fn
+}
+
 func (c *DirectoryCache) SetLocalNodeID(nodeID string) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
@@ -787,6 +825,23 @@ func (c *DirectoryCache) EvictPeer(nodeID, reason string) {
 // Latency records are evicted by TTL. Tombstones are evicted after tombstoneTTL.
 // Caps are enforced on latency (maxLatencyRecords) and per-tenant maps (maxRecordsPerTenant).
 func (c *DirectoryCache) EvictExpired() int {
+	removed, livenessEvicted, notify := c.evictExpiredLocked()
+
+	// Fire the liveness verdicts outside inMemMu. The callback publishes to a
+	// transport (HSTLES turns each into a swarm observer attestation), and
+	// holding the cache lock across a transport call invites deadlock — the
+	// transport's own delivery path can re-enter this cache.
+	for _, nodeID := range livenessEvicted {
+		notify(nodeID)
+	}
+	return removed
+}
+
+// evictExpiredLocked performs the sweep under inMemMu and returns the nodes the
+// liveness pass declared dead, plus the notify callback to invoke for each once
+// the lock is released. notify is never nil — it is a no-op when unset — so the
+// caller needs no branch.
+func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	now := time.Now()
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
@@ -795,6 +850,7 @@ func (c *DirectoryCache) EvictExpired() int {
 	removedReach := 0
 	removedLatency := 0
 	removedRoles := 0
+	var livenessEvicted []string
 	gossipCutoff := now.Add(-GossipLivenessTimeout)
 
 	// --- Evict member records by gossip liveness ---
@@ -854,6 +910,11 @@ func (c *DirectoryCache) EvictExpired() int {
 				// gets 401/404 and falls back to TLS.
 				roleHit := c.evictRoleForNode(tenant, rec.NodeID)
 				removedRoles += roleHit
+				// Report the verdict upward so the transport can attest to it.
+				// Collected here and fired after inMemMu is released: the
+				// callback publishes to swarm, and holding the cache lock
+				// across a transport call invites deadlock.
+				livenessEvicted = append(livenessEvicted, rec.NodeID)
 				log.Printf("[LIVENESS-EVICT] tenant=%s node=%s lastSeen=%s ageSec=%d latencyEvicted=%d rolesEvicted=%d gossipCutoff=%s",
 					tenant, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, roleHit, gossipCutoff.UTC().Format(time.RFC3339))
 			}
@@ -1077,7 +1138,11 @@ func (c *DirectoryCache) EvictExpired() int {
 			totalMembers, totalReach, c.store.CountLatency(), totalRoles)
 	}
 
-	return removed
+	notify := c.onLivenessEvict
+	if notify == nil {
+		notify = func(string) {}
+	}
+	return removed, livenessEvicted, notify
 }
 
 // ApplyLocal ingests a ledger record into the cache WITHOUT the topic
