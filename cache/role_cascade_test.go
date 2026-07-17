@@ -77,6 +77,97 @@ func TestEvictExpired_CascadesRolesForDeadNode(t *testing.T) {
 	}
 }
 
+// TestEvictExpired_OnLivenessEvict_FiresForDeadNodeOutsideLock is the guard for
+// the hook that finally lets a dead node be COLLECTIVELY forgotten.
+//
+// The sweep's verdict was trapped in-process: emitTombstone downgrades reason
+// "liveness" to "liveness-local" so it is never gossiped (a node that blips
+// must not be cascade-evicted fleet-wide). The price of that safety is that
+// every peer evicts on its own independent clock, and any peer whose clock has
+// not fired re-gossips the corpse straight back — the record ping-pongs
+// forever. Measured on the live fleet: 11 real machines, 40 identities, ghosts
+// surviving 15+ hours.
+//
+// The hook exports the observation without exporting authority. HSTLES turns it
+// into a swarm observer attestation that only becomes a propagating death once
+// K distinct anchors independently agree.
+//
+// The callback MUST fire outside inMemMu: it publishes to a transport whose
+// delivery path can re-enter this cache. This test would deadlock, not fail, if
+// that regressed — which is exactly why it re-enters the cache on purpose.
+func TestEvictExpired_OnLivenessEvict_FiresForDeadNodeOutsideLock(t *testing.T) {
+	const (
+		tenant = "t1"
+		ghost  = "vl1_ghostnode"
+		self   = "vl1_selfnode"
+	)
+
+	c := NewDirectoryCache()
+	c.SetLocalNodeID(self)
+
+	var got []string
+	c.SetOnLivenessEvict(func(nodeID string) {
+		// Re-enter the cache from inside the callback. If the sweep ever
+		// fires this under inMemMu again, this call blocks forever and the
+		// test hangs — a louder signal than a failed assertion.
+		_ = c.CacheStats()
+		got = append(got, nodeID)
+	})
+
+	dead := time.Now().Add(-2 * GossipLivenessTimeout)
+	c.store.PutMember(tenant, lad.MemberRecord{TenantID: tenant, NodeID: ghost, CreatedAt: dead})
+
+	c.EvictExpired()
+
+	if len(got) != 1 || got[0] != ghost {
+		t.Fatalf("liveness hook did not report the dead node: got %v, want [%s] — "+
+			"without it the verdict never leaves this process and the corpse is "+
+			"re-gossiped back by any peer whose own 16-min clock has not fired",
+			got, ghost)
+	}
+}
+
+// TestEvictExpired_OnLivenessEvict_SilentForLiveNode: the hook must never fire
+// for a node that is alive. Each call becomes an attestation that a peer is
+// dead; attesting against a live node is the cascade the quorum exists to stop.
+func TestEvictExpired_OnLivenessEvict_SilentForLiveNode(t *testing.T) {
+	const (
+		tenant = "t1"
+		live   = "vl1_livenode"
+		self   = "vl1_selfnode"
+	)
+
+	c := NewDirectoryCache()
+	c.SetLocalNodeID(self)
+
+	var fired int
+	c.SetOnLivenessEvict(func(string) { fired++ })
+
+	now := time.Now()
+	c.store.PutMember(tenant, lad.MemberRecord{TenantID: tenant, NodeID: live, CreatedAt: now})
+	c.store.PutGossipSeen(live, now)
+
+	c.EvictExpired()
+
+	if fired != 0 {
+		t.Fatalf("liveness hook fired %d times for a LIVE node — each call is an "+
+			"attestation that the peer is dead", fired)
+	}
+}
+
+// TestEvictExpired_OnLivenessEvict_UnsetIsSafe: the hook is optional. An
+// unset callback must not panic — every existing consumer leaves it nil.
+func TestEvictExpired_OnLivenessEvict_UnsetIsSafe(t *testing.T) {
+	c := NewDirectoryCache()
+	c.SetLocalNodeID("vl1_selfnode")
+	c.store.PutMember("t1", lad.MemberRecord{
+		TenantID:  "t1",
+		NodeID:    "vl1_ghost",
+		CreatedAt: time.Now().Add(-2 * GossipLivenessTimeout),
+	})
+	c.EvictExpired() // must not panic
+}
+
 // TestEvictExpired_ReapsAlreadyOrphanedRole covers the fleet's ACTUAL state.
 //
 // The cascade fires the instant a member is liveness-evicted, so it cannot
