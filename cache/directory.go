@@ -794,6 +794,7 @@ func (c *DirectoryCache) EvictExpired() int {
 	removedMembers := 0
 	removedReach := 0
 	removedLatency := 0
+	removedRoles := 0
 	gossipCutoff := now.Add(-GossipLivenessTimeout)
 
 	// --- Evict member records by gossip liveness ---
@@ -840,8 +841,21 @@ func (c *DirectoryCache) EvictExpired() int {
 				// instead of waiting for their 10-minute TTL to expire.
 				latencyHit := c.evictLatencyForNode(rec.NodeID)
 				removedLatency += latencyHit
-				log.Printf("[LIVENESS-EVICT] tenant=%s node=%s lastSeen=%s ageSec=%d latencyEvicted=%d gossipCutoff=%s",
-					tenant, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, gossipCutoff.UTC().Format(time.RFC3339))
+				// Roles must cascade for the same reason, and more urgently:
+				// a RoleRecord carries no ExpiresAt and no sweep of its own,
+				// so this is its ONLY expiry path. The only other deletion is
+				// EvictNode, which a node calls on ITSELF at graceful shutdown
+				// — never reached when a machine is replaced by a deploy. The
+				// record is a projection the reach bridge pairs onto an
+				// inbound swarm fleet.peer record; without this it outlives
+				// its source forever. mesh-topology builds machines[] from the
+				// role table, so an orphan renders as a healthy peer that
+				// peers keep dialling: noise-UDP hangs to msg2 timeout, WS
+				// gets 401/404 and falls back to TLS.
+				roleHit := c.evictRoleForNode(tenant, rec.NodeID)
+				removedRoles += roleHit
+				log.Printf("[LIVENESS-EVICT] tenant=%s node=%s lastSeen=%s ageSec=%d latencyEvicted=%d rolesEvicted=%d gossipCutoff=%s",
+					tenant, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, roleHit, gossipCutoff.UTC().Format(time.RFC3339))
 			}
 		}
 	}
@@ -996,8 +1010,50 @@ func (c *DirectoryCache) EvictExpired() int {
 		}
 	}
 
+	// --- Evict ORPHANED role records ---
+	//
+	// The cascade above only fires the moment a member is liveness-evicted, so
+	// it cannot reach a role whose member is ALREADY gone. Every node that died
+	// before roles had any expiry path left exactly that: a role with no member,
+	// which no code path could ever remove. Live fleet: 127 roles against 8
+	// members and ~11 real machines, and mesh-topology builds machines[] from
+	// the role table — so each orphan renders as a healthy grade-A peer that
+	// peers keep dialling (noise-UDP to msg2 timeout, WS 401/404 -> TLS).
+	//
+	// A role is a projection the reach bridge pairs onto an inbound swarm
+	// fleet.peer record. No member means the source is gone and the projection
+	// is garbage. Every skip below exists because a role is far more dangerous
+	// to evict wrongly than to leave: a live node stripped of its advertised
+	// capabilities is worse than an orphan. So this only reaps a role that is
+	// orphaned AND stale AND silent AND not a connected peer — a node that is
+	// merely quiet, or whose member has not arrived yet, keeps its roles.
+	for tenant, roles := range c.store.AllRoles() {
+		for _, r := range roles {
+			if c.localNodeID != "" && r.NodeID == c.localNodeID {
+				continue
+			}
+			if _, ok := c.store.GetMember(tenant, r.NodeID); ok {
+				continue // member alive — the cascade owns this role
+			}
+			if c.hasLivenessOverride(r.NodeID) {
+				continue // connected peer; its member is merely late
+			}
+			if lastSeen, ok := c.store.GetGossipSeen(r.NodeID); ok && !lastSeen.Before(gossipCutoff) {
+				continue // still gossiping with us
+			}
+			if r.Updated.After(gossipCutoff) {
+				continue // refreshed within the liveness window — not yet dead
+			}
+			if hit := c.evictRoleForNode(tenant, r.NodeID); hit > 0 {
+				removedRoles += hit
+				log.Printf("[ORPHAN-ROLE-EVICT] tenant=%s node=%s updated=%s ageSec=%d (no member record)",
+					tenant, r.NodeID, r.Updated.UTC().Format(time.RFC3339), int(now.Sub(r.Updated).Seconds()))
+			}
+		}
+	}
+
 	// --- Phase 1: Observability logging (only when evictions > 0) ---
-	removed := removedMembers + removedReach + removedLatency
+	removed := removedMembers + removedReach + removedLatency + removedRoles
 	if removed > 0 {
 		totalMembers := 0
 		for _, members := range c.store.AllMembers() {
@@ -1007,9 +1063,18 @@ func (c *DirectoryCache) EvictExpired() int {
 		for _, records := range c.store.AllReach() {
 			totalReach += len(records)
 		}
-		dbgCache.Printf("Evicted: %d members, %d reach, %d latency (cache: %d members, %d reach, %d latency)",
-			removedMembers, removedReach, removedLatency,
-			totalMembers, totalReach, c.store.CountLatency())
+		// Roles are reported alongside the swept topics because a role count
+		// far above the member count is the signature of orphaned projections
+		// — the condition this sweep exists to prevent, and one that was
+		// invisible while roles went uncounted (live fleet: 127 roles against
+		// 8 members and ~11 real machines).
+		totalRoles := 0
+		for _, roles := range c.store.AllRoles() {
+			totalRoles += len(roles)
+		}
+		dbgCache.Printf("Evicted: %d members, %d reach, %d latency, %d roles (cache: %d members, %d reach, %d latency, %d roles)",
+			removedMembers, removedReach, removedLatency, removedRoles,
+			totalMembers, totalReach, c.store.CountLatency(), totalRoles)
 	}
 
 	return removed
@@ -1675,6 +1740,27 @@ func (c *DirectoryCache) evictLatencyForNode(nodeID string) int {
 		}
 	}
 	return removed
+}
+
+// evictRoleForNode drops the role record orphaned by a member eviction, and is
+// that record's only expiry path: RoleRecord has no ExpiresAt and EvictExpired
+// sweeps members, reach and latency but never roles.
+//
+// Callers must hold inMemMu and must only call this for a node the member sweep
+// has just declared dead — a role outliving a live member would silently strip
+// that node of its advertised capabilities, which is worse than the orphan.
+//
+// The "liveness" reason is load-bearing: emitTombstone rewrites it to
+// "liveness-local", so the tombstone blocks gossip from re-inserting the stale
+// role locally without propagating an eviction that would suppress the node's
+// own re-announcement after a restart.
+func (c *DirectoryCache) evictRoleForNode(tenant, nodeID string) int {
+	if _, ok := c.store.GetRole(tenant, nodeID); !ok {
+		return 0
+	}
+	c.store.DeleteRole(tenant, nodeID)
+	c.emitTombstone(lad.TopicRole, tenant, nodeID, "liveness")
+	return 1
 }
 
 func (c *DirectoryCache) storeLatency(lat lad.LatencyRecord) {
