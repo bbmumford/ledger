@@ -105,7 +105,7 @@ func RecordFingerprint(rec Record) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(rec.Topic))
 	h.Write([]byte(rec.NodeID))
-	h.Write([]byte(rec.TenantID))
+	h.Write([]byte(rec.Partition))
 	var buf [8]byte
 	binary.BigEndian.PutUint64(buf[:], uint64(rec.Timestamp.UnixNano()))
 	h.Write(buf[:])

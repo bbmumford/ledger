@@ -34,7 +34,7 @@ func TestDirectoryCacheApplyMember(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	member := lad.MemberRecord{
-		TenantID:  "tenant-1",
+		Partition: "tenant-1",
 		NodeID:    "node-1",
 		PubKey:    []byte("test-key"),
 		CreatedAt: time.Now(),
@@ -73,10 +73,10 @@ func TestDirectoryCacheApplyRole(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	role := lad.RoleRecord{
-		TenantID: "tenant-1",
-		NodeID:   "node-1",
-		Roles:    []string{"auth", "identity"},
-		Updated:  time.Now(),
+		Partition: "tenant-1",
+		NodeID:    "node-1",
+		Roles:     []string{"auth", "identity"},
+		Updated:   time.Now(),
 	}
 	body, err := json.Marshal(role)
 	if err != nil {
@@ -112,8 +112,8 @@ func TestDirectoryCacheApplyReach(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	reach := lad.ReachRecord{
-		TenantID: "tenant-1",
-		NodeID:   "node-1",
+		Partition: "tenant-1",
+		NodeID:    "node-1",
 		Addresses: []lad.ReachAddress{
 			{Host: "192.168.1.1", Port: 8000, Proto: "tcp", Scope: "lan"},
 			{Host: "10.0.0.1", Port: 8000, Proto: "tcp", Scope: "lan"},
@@ -160,14 +160,14 @@ func TestDirectoryCacheApplyReach(t *testing.T) {
 func TestDirectoryCacheMembersFiltering(t *testing.T) {
 	cache := NewDirectoryCache()
 
-	// Add members to different tenants
-	tenants := []string{"tenant-1", "tenant-2"}
-	for _, tenant := range tenants {
+	// Add members to different partitions
+	partitions := []string{"tenant-1", "tenant-2"}
+	for _, partition := range partitions {
 		for i := 0; i < 3; i++ {
 			member := lad.MemberRecord{
-				TenantID: tenant,
-				NodeID:   tenant + "-node-" + string(rune('A'+i)),
-				PubKey:   []byte("key"),
+				Partition: partition,
+				NodeID:    partition + "-node-" + string(rune('A'+i)),
+				PubKey:    []byte("key"),
 			}
 			body, _ := json.Marshal(member)
 			cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
@@ -176,7 +176,7 @@ func TestDirectoryCacheMembersFiltering(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Query tenant-1
+	// Query partition-1
 	members, err := cache.Members(ctx, "tenant-1")
 	if err != nil {
 		t.Fatalf("Members failed: %v", err)
@@ -185,7 +185,7 @@ func TestDirectoryCacheMembersFiltering(t *testing.T) {
 		t.Errorf("Expected 3 members for tenant-1, got %d", len(members))
 	}
 
-	// Query tenant-2
+	// Query partition-2
 	members, err = cache.Members(ctx, "tenant-2")
 	if err != nil {
 		t.Fatalf("Members failed: %v", err)
@@ -194,7 +194,7 @@ func TestDirectoryCacheMembersFiltering(t *testing.T) {
 		t.Errorf("Expected 3 members for tenant-2, got %d", len(members))
 	}
 
-	// Query non-existent tenant
+	// Query non-existent partition
 	members, err = cache.Members(ctx, "tenant-3")
 	if err != nil {
 		t.Fatalf("Members failed: %v", err)
@@ -209,9 +209,9 @@ func TestDirectoryCacheRolesFiltering(t *testing.T) {
 
 	// Add roles
 	roles := []lad.RoleRecord{
-		{TenantID: "tenant-1", NodeID: "node-1", Roles: []string{"auth", "identity"}, Updated: time.Now()},
-		{TenantID: "tenant-1", NodeID: "node-2", Roles: []string{"notify"}, Updated: time.Now()},
-		{TenantID: "tenant-1", NodeID: "node-3", Roles: []string{"auth", "maintenance"}, Updated: time.Now()},
+		{Partition: "tenant-1", NodeID: "node-1", Roles: []string{"auth", "identity"}, Updated: time.Now()},
+		{Partition: "tenant-1", NodeID: "node-2", Roles: []string{"notify"}, Updated: time.Now()},
+		{Partition: "tenant-1", NodeID: "node-3", Roles: []string{"auth", "maintenance"}, Updated: time.Now()},
 	}
 	for _, role := range roles {
 		body, _ := json.Marshal(role)
@@ -245,9 +245,9 @@ func TestDirectoryCacheReachFiltering(t *testing.T) {
 
 	// Add reach records
 	reaches := []lad.ReachRecord{
-		{TenantID: "tenant-1", NodeID: "node-1", Region: "iad", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
-		{TenantID: "tenant-1", NodeID: "node-2", Region: "lhr", Availability: 0.80, LoadFactor: 0.6, ExpiresAt: expireTime},
-		{TenantID: "tenant-1", NodeID: "node-3", Region: "iad", Availability: 0.50, LoadFactor: 0.9, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-1", Region: "iad", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-2", Region: "lhr", Availability: 0.80, LoadFactor: 0.6, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-3", Region: "iad", Availability: 0.50, LoadFactor: 0.9, ExpiresAt: expireTime},
 	}
 	for _, reach := range reaches {
 		body, _ := json.Marshal(reach)
@@ -335,8 +335,8 @@ func TestDirectoryCacheConcurrency(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 			member := lad.MemberRecord{
-				TenantID: "tenant-1",
-				NodeID:   string(rune('A' + id%26)),
+				Partition: "tenant-1",
+				NodeID:    string(rune('A' + id%26)),
 			}
 			body, _ := json.Marshal(member)
 			cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
@@ -379,7 +379,7 @@ func TestDirectoryCacheExpiredReach(t *testing.T) {
 
 	// Add an expired reach record
 	reach := lad.ReachRecord{
-		TenantID:     "tenant-1",
+		Partition:    "tenant-1",
 		NodeID:       "node-1",
 		Region:       "iad",
 		Availability: 0.95,
@@ -404,9 +404,9 @@ func TestDirectoryCacheReachRegionPreference(t *testing.T) {
 
 	// Add reach records in different regions with same availability
 	reaches := []lad.ReachRecord{
-		{TenantID: "tenant-1", NodeID: "node-1", Region: "lhr", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
-		{TenantID: "tenant-1", NodeID: "node-2", Region: "iad", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
-		{TenantID: "tenant-1", NodeID: "node-3", Region: "syd", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-1", Region: "lhr", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-2", Region: "iad", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
+		{Partition: "tenant-1", NodeID: "node-3", Region: "syd", Availability: 0.95, LoadFactor: 0.3, ExpiresAt: expireTime},
 	}
 	for _, reach := range reaches {
 		body, _ := json.Marshal(reach)
@@ -437,13 +437,13 @@ func TestEvictExpired(t *testing.T) {
 	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-old": {
-			TenantID:  "tenant-1",
+			Partition: "tenant-1",
 			NodeID:    "node-old",
 			Region:    "iad",
 			ExpiresAt: time.Now().Add(-10 * time.Minute), // expired
 		},
 		"node-live": {
-			TenantID:  "tenant-1",
+			Partition: "tenant-1",
 			NodeID:    "node-live",
 			Region:    "iad",
 			ExpiresAt: time.Now().Add(1 * time.Hour), // still valid
@@ -469,14 +469,14 @@ func TestEvictExpired(t *testing.T) {
 	}
 }
 
-func TestEvictExpiredCleansEmptyTenantMaps(t *testing.T) {
+func TestEvictExpiredCleansEmptyPartitionMaps(t *testing.T) {
 	cache := NewDirectoryCache()
 
-	// Insert a single expired record for a tenant.
+	// Insert a single expired record for a partition.
 	cache.inMemMu.Lock()
 	cache.reach["tenant-gone"] = map[string]lad.ReachRecord{
 		"node-1": {
-			TenantID:  "tenant-gone",
+			Partition: "tenant-gone",
 			NodeID:    "node-1",
 			ExpiresAt: time.Now().Add(-1 * time.Minute),
 		},
@@ -497,7 +497,7 @@ func TestStoreReachRejectsExpired(t *testing.T) {
 	cache := NewDirectoryCache()
 
 	reach := lad.ReachRecord{
-		TenantID:  "tenant-1",
+		Partition: "tenant-1",
 		NodeID:    "node-1",
 		ExpiresAt: time.Now().Add(-5 * time.Minute),
 	}
@@ -518,7 +518,7 @@ func TestStoreReachKeepsNewerSeq(t *testing.T) {
 
 	// Apply record with seq=10
 	r1 := lad.ReachRecord{
-		TenantID:  "tenant-1",
+		Partition: "tenant-1",
 		NodeID:    "node-1",
 		Region:    "iad",
 		ExpiresAt: expiry,
@@ -528,7 +528,7 @@ func TestStoreReachKeepsNewerSeq(t *testing.T) {
 
 	// Apply older record with seq=5 — should be rejected
 	r2 := lad.ReachRecord{
-		TenantID:  "tenant-1",
+		Partition: "tenant-1",
 		NodeID:    "node-1",
 		Region:    "lhr",
 		ExpiresAt: expiry,
@@ -553,12 +553,12 @@ func TestDumpSkipsExpiredReach(t *testing.T) {
 	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-expired": {
-			TenantID:  "tenant-1",
+			Partition: "tenant-1",
 			NodeID:    "node-expired",
 			ExpiresAt: time.Now().Add(-1 * time.Hour),
 		},
 		"node-live": {
-			TenantID:  "tenant-1",
+			Partition: "tenant-1",
 			NodeID:    "node-live",
 			ExpiresAt: time.Now().Add(1 * time.Hour),
 		},
@@ -587,7 +587,7 @@ func TestStartStopEviction(t *testing.T) {
 	cache.inMemMu.Lock()
 	cache.reach["tenant-1"] = map[string]lad.ReachRecord{
 		"node-1": {
-			TenantID:  "tenant-1",
+			Partition: "tenant-1",
 			NodeID:    "node-1",
 			ExpiresAt: time.Now().Add(-1 * time.Second),
 		},
@@ -613,8 +613,8 @@ func TestStartStopEviction(t *testing.T) {
 func BenchmarkDirectoryCacheApply(b *testing.B) {
 	cache := NewDirectoryCache()
 	member := lad.MemberRecord{
-		TenantID: "tenant-1",
-		NodeID:   "node-1",
+		Partition: "tenant-1",
+		NodeID:    "node-1",
 	}
 	body, _ := json.Marshal(member)
 	rec := lad.Record{Topic: lad.TopicMember, Body: body}
@@ -631,8 +631,8 @@ func BenchmarkDirectoryCacheMembers(b *testing.B) {
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		member := lad.MemberRecord{
-			TenantID: "tenant-1",
-			NodeID:   string(rune(i)),
+			Partition: "tenant-1",
+			NodeID:    string(rune(i)),
 		}
 		body, _ := json.Marshal(member)
 		cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
@@ -652,7 +652,7 @@ func BenchmarkDirectoryCacheReach(b *testing.B) {
 	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		reach := lad.ReachRecord{
-			TenantID:     "tenant-1",
+			Partition:    "tenant-1",
 			NodeID:       string(rune(i)),
 			Region:       "iad",
 			Availability: 0.95,

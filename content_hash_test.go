@@ -18,7 +18,7 @@ func TestContentHash_Stable(t *testing.T) {
 	body, _ := json.Marshal(map[string]string{"key": "value"})
 	r := Record{
 		Topic:        "members",
-		TenantID:     "tenant-a",
+		Partition:    "tenant-a",
 		NodeID:       "node-1",
 		Body:         body,
 		HLCTimestamp: 1234567890,

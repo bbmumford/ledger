@@ -68,7 +68,7 @@ A transport moves bytes. Ledger gives those bytes meaning — typed records for 
 type Record struct {
     Topic        Topic           // member, role, reach, latency, keyops, quorum
     NodeID       string          // which peer this record describes
-    TenantID     string          // tenant scope (empty = global)
+    Partition    string          // partition scope (empty = global)
     Body         json.RawMessage // typed payload (MemberRecord, RoleRecord, etc.)
     Timestamp    time.Time
     LamportClock uint64          // causal ordering
@@ -100,7 +100,7 @@ type Record struct {
 3. **CRDT-friendly**. Records converge deterministically given the same set of observations — ordering doesn't matter for eventual consistency, Lamport clock breaks ties for causally-dependent updates.
 4. **Transport-agnostic**. Ledger doesn't import any network code. The `whisper_adapter.go` provides `GossipPayload` serialisation; consumers wire Ledger to Whisper (or any other gossip engine) at the integration layer.
 5. **Pluggable persistence**. `CacheStore` is an interface with a memory-backed default; consumers plug in SQLite, Turso, or any KV store that satisfies the contract.
-6. **Tenant isolation**. Every record carries a `TenantID`. Queries scope to a tenant; the empty string is the global scope. Multi-tenant deployments never see cross-tenant state.
+6. **Partition isolation**. Every record carries a `Partition`. Queries scope to a partition; the empty string is the global scope. A deployment with several partitions never serves one partition's state to another.
 
 ---
 

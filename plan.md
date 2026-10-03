@@ -1,3 +1,9 @@
+---
+status: SHIPPED
+verified: 2026-07-03
+evidence: ledger v0.0.17 tagged; repo has anchor/, blob.go, cache/, expiry.go, metrics.go, acl.go, compaction.go, conflict.go, pb/ — all Phase 1-3a deliverables present. Memory notes "Step 4 COMPLETE (Phase 2-4 distributed blob pipeline shipped)". HSTLES Library at v0.0.412 consumes ledger via bbmumford/ledger import. Canonical package plan — kept in place, not archived.
+---
+
 # Ledger — Extraction + Agnostic Redesign Plan
 
 > Extract `mesh/core/directory/` from HSTLES Library into `github.com/bbmumford/ledger`, then redesign it to serve ALL consumers (HSTLES/ORBTR, Hospitium, Mercury) with pluggable merge functions, flexible keys, and HLC support.

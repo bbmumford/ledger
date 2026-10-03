@@ -37,8 +37,8 @@ func NewMemoryCacheStore() *MemoryCacheStore {
 
 // --- Members ---
 
-func (s *MemoryCacheStore) GetMember(tenant, nodeID string) (lad.MemberRecord, bool) {
-	tm, ok := s.Members[tenant]
+func (s *MemoryCacheStore) GetMember(partition, nodeID string) (lad.MemberRecord, bool) {
+	tm, ok := s.Members[partition]
 	if !ok {
 		return lad.MemberRecord{}, false
 	}
@@ -46,24 +46,24 @@ func (s *MemoryCacheStore) GetMember(tenant, nodeID string) (lad.MemberRecord, b
 	return m, ok
 }
 
-func (s *MemoryCacheStore) PutMember(tenant string, member lad.MemberRecord) {
-	if _, ok := s.Members[tenant]; !ok {
-		s.Members[tenant] = make(map[string]lad.MemberRecord)
+func (s *MemoryCacheStore) PutMember(partition string, member lad.MemberRecord) {
+	if _, ok := s.Members[partition]; !ok {
+		s.Members[partition] = make(map[string]lad.MemberRecord)
 	}
-	s.Members[tenant][member.NodeID] = member
+	s.Members[partition][member.NodeID] = member
 }
 
-func (s *MemoryCacheStore) DeleteMember(tenant, nodeID string) {
-	if tm, ok := s.Members[tenant]; ok {
+func (s *MemoryCacheStore) DeleteMember(partition, nodeID string) {
+	if tm, ok := s.Members[partition]; ok {
 		delete(tm, nodeID)
 		if len(tm) == 0 {
-			delete(s.Members, tenant)
+			delete(s.Members, partition)
 		}
 	}
 }
 
-func (s *MemoryCacheStore) ListMembers(tenant string) []lad.MemberRecord {
-	tm := s.Members[tenant]
+func (s *MemoryCacheStore) ListMembers(partition string) []lad.MemberRecord {
+	tm := s.Members[partition]
 	result := make([]lad.MemberRecord, 0, len(tm))
 	for _, m := range tm {
 		result = append(result, m)
@@ -73,24 +73,24 @@ func (s *MemoryCacheStore) ListMembers(tenant string) []lad.MemberRecord {
 
 func (s *MemoryCacheStore) AllMembers() map[string][]lad.MemberRecord {
 	out := make(map[string][]lad.MemberRecord, len(s.Members))
-	for tenant, tm := range s.Members {
+	for partition, tm := range s.Members {
 		members := make([]lad.MemberRecord, 0, len(tm))
 		for _, m := range tm {
 			members = append(members, m)
 		}
-		out[tenant] = members
+		out[partition] = members
 	}
 	return out
 }
 
-func (s *MemoryCacheStore) CountMembers(tenant string) int {
-	return len(s.Members[tenant])
+func (s *MemoryCacheStore) CountMembers(partition string) int {
+	return len(s.Members[partition])
 }
 
 // --- Roles ---
 
-func (s *MemoryCacheStore) GetRole(tenant, nodeID string) (lad.RoleRecord, bool) {
-	tm, ok := s.Roles[tenant]
+func (s *MemoryCacheStore) GetRole(partition, nodeID string) (lad.RoleRecord, bool) {
+	tm, ok := s.Roles[partition]
 	if !ok {
 		return lad.RoleRecord{}, false
 	}
@@ -98,24 +98,24 @@ func (s *MemoryCacheStore) GetRole(tenant, nodeID string) (lad.RoleRecord, bool)
 	return r, ok
 }
 
-func (s *MemoryCacheStore) PutRole(tenant string, role lad.RoleRecord) {
-	if _, ok := s.Roles[tenant]; !ok {
-		s.Roles[tenant] = make(map[string]lad.RoleRecord)
+func (s *MemoryCacheStore) PutRole(partition string, role lad.RoleRecord) {
+	if _, ok := s.Roles[partition]; !ok {
+		s.Roles[partition] = make(map[string]lad.RoleRecord)
 	}
-	s.Roles[tenant][role.NodeID] = role
+	s.Roles[partition][role.NodeID] = role
 }
 
-func (s *MemoryCacheStore) DeleteRole(tenant, nodeID string) {
-	if tm, ok := s.Roles[tenant]; ok {
+func (s *MemoryCacheStore) DeleteRole(partition, nodeID string) {
+	if tm, ok := s.Roles[partition]; ok {
 		delete(tm, nodeID)
 		if len(tm) == 0 {
-			delete(s.Roles, tenant)
+			delete(s.Roles, partition)
 		}
 	}
 }
 
-func (s *MemoryCacheStore) ListRoles(tenant string) []lad.RoleRecord {
-	tm := s.Roles[tenant]
+func (s *MemoryCacheStore) ListRoles(partition string) []lad.RoleRecord {
+	tm := s.Roles[partition]
 	result := make([]lad.RoleRecord, 0, len(tm))
 	for _, r := range tm {
 		result = append(result, r)
@@ -125,20 +125,20 @@ func (s *MemoryCacheStore) ListRoles(tenant string) []lad.RoleRecord {
 
 func (s *MemoryCacheStore) AllRoles() map[string][]lad.RoleRecord {
 	out := make(map[string][]lad.RoleRecord, len(s.Roles))
-	for tenant, tm := range s.Roles {
+	for partition, tm := range s.Roles {
 		roles := make([]lad.RoleRecord, 0, len(tm))
 		for _, r := range tm {
 			roles = append(roles, r)
 		}
-		out[tenant] = roles
+		out[partition] = roles
 	}
 	return out
 }
 
 // --- Reach ---
 
-func (s *MemoryCacheStore) GetReach(tenant, nodeID string) (lad.ReachRecord, bool) {
-	tm, ok := s.Reach[tenant]
+func (s *MemoryCacheStore) GetReach(partition, nodeID string) (lad.ReachRecord, bool) {
+	tm, ok := s.Reach[partition]
 	if !ok {
 		return lad.ReachRecord{}, false
 	}
@@ -146,24 +146,24 @@ func (s *MemoryCacheStore) GetReach(tenant, nodeID string) (lad.ReachRecord, boo
 	return r, ok
 }
 
-func (s *MemoryCacheStore) PutReach(tenant string, reach lad.ReachRecord) {
-	if _, ok := s.Reach[tenant]; !ok {
-		s.Reach[tenant] = make(map[string]lad.ReachRecord)
+func (s *MemoryCacheStore) PutReach(partition string, reach lad.ReachRecord) {
+	if _, ok := s.Reach[partition]; !ok {
+		s.Reach[partition] = make(map[string]lad.ReachRecord)
 	}
-	s.Reach[tenant][reach.NodeID] = reach
+	s.Reach[partition][reach.NodeID] = reach
 }
 
-func (s *MemoryCacheStore) DeleteReach(tenant, nodeID string) {
-	if tm, ok := s.Reach[tenant]; ok {
+func (s *MemoryCacheStore) DeleteReach(partition, nodeID string) {
+	if tm, ok := s.Reach[partition]; ok {
 		delete(tm, nodeID)
 		if len(tm) == 0 {
-			delete(s.Reach, tenant)
+			delete(s.Reach, partition)
 		}
 	}
 }
 
-func (s *MemoryCacheStore) ListReach(tenant string) []lad.ReachRecord {
-	tm := s.Reach[tenant]
+func (s *MemoryCacheStore) ListReach(partition string) []lad.ReachRecord {
+	tm := s.Reach[partition]
 	result := make([]lad.ReachRecord, 0, len(tm))
 	for _, r := range tm {
 		result = append(result, r)
@@ -173,18 +173,18 @@ func (s *MemoryCacheStore) ListReach(tenant string) []lad.ReachRecord {
 
 func (s *MemoryCacheStore) AllReach() map[string][]lad.ReachRecord {
 	out := make(map[string][]lad.ReachRecord, len(s.Reach))
-	for tenant, tm := range s.Reach {
+	for partition, tm := range s.Reach {
 		records := make([]lad.ReachRecord, 0, len(tm))
 		for _, r := range tm {
 			records = append(records, r)
 		}
-		out[tenant] = records
+		out[partition] = records
 	}
 	return out
 }
 
-func (s *MemoryCacheStore) CountReach(tenant string) int {
-	return len(s.Reach[tenant])
+func (s *MemoryCacheStore) CountReach(partition string) int {
+	return len(s.Reach[partition])
 }
 
 // --- Latency ---

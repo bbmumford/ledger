@@ -16,27 +16,27 @@ import (
 // use its own locking — DirectoryCache's c.inMemMu is authoritative.
 type CacheStore interface {
 	// Members
-	GetMember(tenant, nodeID string) (lad.MemberRecord, bool)
-	PutMember(tenant string, member lad.MemberRecord)
-	DeleteMember(tenant, nodeID string)
-	ListMembers(tenant string) []lad.MemberRecord
-	AllMembers() map[string][]lad.MemberRecord // tenant -> members
-	CountMembers(tenant string) int
+	GetMember(partition, nodeID string) (lad.MemberRecord, bool)
+	PutMember(partition string, member lad.MemberRecord)
+	DeleteMember(partition, nodeID string)
+	ListMembers(partition string) []lad.MemberRecord
+	AllMembers() map[string][]lad.MemberRecord // partition -> members
+	CountMembers(partition string) int
 
 	// Roles
-	GetRole(tenant, nodeID string) (lad.RoleRecord, bool)
-	PutRole(tenant string, role lad.RoleRecord)
-	DeleteRole(tenant, nodeID string)
-	ListRoles(tenant string) []lad.RoleRecord
+	GetRole(partition, nodeID string) (lad.RoleRecord, bool)
+	PutRole(partition string, role lad.RoleRecord)
+	DeleteRole(partition, nodeID string)
+	ListRoles(partition string) []lad.RoleRecord
 	AllRoles() map[string][]lad.RoleRecord
 
 	// Reach
-	GetReach(tenant, nodeID string) (lad.ReachRecord, bool)
-	PutReach(tenant string, reach lad.ReachRecord)
-	DeleteReach(tenant, nodeID string)
-	ListReach(tenant string) []lad.ReachRecord
+	GetReach(partition, nodeID string) (lad.ReachRecord, bool)
+	PutReach(partition string, reach lad.ReachRecord)
+	DeleteReach(partition, nodeID string)
+	ListReach(partition string) []lad.ReachRecord
 	AllReach() map[string][]lad.ReachRecord
-	CountReach(tenant string) int
+	CountReach(partition string) int
 
 	// Latency
 	GetLatency(key string) (lad.LatencyRecord, bool)

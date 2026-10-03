@@ -52,9 +52,9 @@ const GossipLivenessTimeout = 16 * time.Minute
 // Revisit when QUIC transport is enabled (3 transports = 330 records).
 const maxLatencyRecords = 250
 
-// maxRecordsPerTenant caps the number of member and reach records per tenant map.
+// maxRecordsPerPartition caps the number of member and reach records per partition map.
 // When exceeded, the oldest records are evicted first.
-const maxRecordsPerTenant = 200
+const maxRecordsPerPartition = 200
 
 // tombstoneTTL is how long tombstone records are retained for gossip propagation.
 const tombstoneTTL = 30 * time.Minute
@@ -163,10 +163,10 @@ type DirectoryCache struct {
 
 	// Agnostic redesign: per-topic merge and key functions.
 	// When nil, defaults are used (OverwriteMerge, NodeIDKey).
-	mergeFuncs map[lad.Topic]lad.MergeFunc
-	keyFuncs   map[lad.Topic]lad.KeyFunc
-	topicCfgs  map[lad.Topic]lad.TopicConfig
-	metrics    lad.MetricsRecorder
+	mergeFuncs  map[lad.Topic]lad.MergeFunc
+	keyFuncs    map[lad.Topic]lad.KeyFunc
+	topicCfgs   map[lad.Topic]lad.TopicConfig
+	metrics     lad.MetricsRecorder
 	subscribers map[lad.Topic][]func(lad.Record)
 
 	// onLivenessEvict, when set, is invoked for each node the liveness
@@ -191,7 +191,7 @@ type DirectoryCache struct {
 	// ACL, indexing, compaction, and conflict logging.
 	conflictLog *lad.ConflictLog
 	aclFuncs    map[lad.Topic]lad.ACLFunc
-	indexFuncs  map[lad.Topic]map[string]lad.IndexFunc  // topic -> indexName -> func
+	indexFuncs  map[lad.Topic]map[string]lad.IndexFunc           // topic -> indexName -> func
 	indexes     map[lad.Topic]map[string]map[string][]lad.Record // topic -> indexName -> key -> records
 	compaction  map[lad.Topic]lad.CompactionPolicy
 
@@ -202,7 +202,7 @@ type DirectoryCache struct {
 	// full snapshot to refresh. See ReachDeltaApplier docs.
 	reachDeltaApplier ReachDeltaApplier
 	// lastReachBody keeps the most recent full-snapshot body per
-	// (tenant, nodeID) so the delta applier has a base to rebuild from.
+	// (partition, nodeID) so the delta applier has a base to rebuild from.
 	// Updated on every full-snapshot apply and on every successful delta
 	// reconstruction. Parallel to store.Reach, not a replacement.
 	lastReachBody map[string]map[string][]byte
@@ -528,7 +528,7 @@ func (c *DirectoryCache) HasRecord(topic lad.Topic, key string) bool {
 
 	switch topic {
 	case lad.TopicMember:
-		// key is treated as "tenant:nodeID"
+		// key is treated as "partition:nodeID"
 		parts := strings.SplitN(key, ":", 2)
 		if len(parts) != 2 {
 			return false
@@ -736,9 +736,9 @@ func (c *DirectoryCache) evictionLoop(interval time.Duration) {
 	}
 }
 
-// tombstoneKey builds a composite key for tombstone dedup: "topic:tenant:nodeID".
-func tombstoneKey(topic lad.Topic, tenantID, nodeID string) string {
-	return string(topic) + ":" + tenantID + ":" + nodeID
+// tombstoneKey builds a composite key for tombstone dedup: "topic:partition:nodeID".
+func tombstoneKey(topic lad.Topic, partitionID, nodeID string) string {
+	return string(topic) + ":" + partitionID + ":" + nodeID
 }
 
 // emitTombstone stores a tombstone record for gossip propagation.
@@ -747,12 +747,12 @@ func tombstoneKey(topic lad.Topic, tenantID, nodeID string) string {
 //   - "liveness" — local-only, NOT propagated (prevents cascade eviction across mesh)
 //
 // Must be called with c.inMemMu held.
-func (c *DirectoryCache) emitTombstone(topic lad.Topic, tenantID, nodeID, reason string) {
+func (c *DirectoryCache) emitTombstone(topic lad.Topic, partitionID, nodeID, reason string) {
 	now := time.Now()
-	key := tombstoneKey(topic, tenantID, nodeID)
+	key := tombstoneKey(topic, partitionID, nodeID)
 	rec := lad.Record{
 		Topic:           topic,
-		TenantID:        tenantID,
+		Partition:       partitionID,
 		NodeID:          nodeID,
 		Tombstone:       true,
 		DeletedAt:       now,
@@ -774,19 +774,19 @@ func (c *DirectoryCache) EvictNode(nodeID string, reason string) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
 
-	// Find and remove from all tenant maps
-	for tenant := range c.store.AllMembers() {
-		if _, ok := c.store.GetMember(tenant, nodeID); ok {
-			c.store.DeleteMember(tenant, nodeID)
-			c.emitTombstone(lad.TopicMember, tenant, nodeID, reason)
+	// Find and remove from all partition maps
+	for partition := range c.store.AllMembers() {
+		if _, ok := c.store.GetMember(partition, nodeID); ok {
+			c.store.DeleteMember(partition, nodeID)
+			c.emitTombstone(lad.TopicMember, partition, nodeID, reason)
 		}
-		if _, ok := c.store.GetReach(tenant, nodeID); ok {
-			c.store.DeleteReach(tenant, nodeID)
-			c.emitTombstone(lad.TopicReach, tenant, nodeID, reason)
+		if _, ok := c.store.GetReach(partition, nodeID); ok {
+			c.store.DeleteReach(partition, nodeID)
+			c.emitTombstone(lad.TopicReach, partition, nodeID, reason)
 		}
-		if _, ok := c.store.GetRole(tenant, nodeID); ok {
-			c.store.DeleteRole(tenant, nodeID)
-			c.emitTombstone(lad.TopicRole, tenant, nodeID, reason)
+		if _, ok := c.store.GetRole(partition, nodeID); ok {
+			c.store.DeleteRole(partition, nodeID)
+			c.emitTombstone(lad.TopicRole, partition, nodeID, reason)
 		}
 	}
 	c.store.DeleteGossipSeen(nodeID)
@@ -823,7 +823,7 @@ func (c *DirectoryCache) EvictPeer(nodeID, reason string) {
 // EvictExpired removes stale records from the cache.
 // Member and reach records are evicted by gossip liveness timeout.
 // Latency records are evicted by TTL. Tombstones are evicted after tombstoneTTL.
-// Caps are enforced on latency (maxLatencyRecords) and per-tenant maps (maxRecordsPerTenant).
+// Caps are enforced on latency (maxLatencyRecords) and per-partition maps (maxRecordsPerPartition).
 func (c *DirectoryCache) EvictExpired() int {
 	removed, livenessEvicted, notify := c.evictExpiredLocked()
 
@@ -865,7 +865,7 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	// stayed healthy — the mechanism behind the 94-tombstones-vs-2-
 	// members symptom on help.orbtr.io after fleet-wide deploys.
 	allMembers := c.store.AllMembers()
-	for tenant, members := range allMembers {
+	for partition, members := range allMembers {
 		for _, rec := range members {
 			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
 				continue
@@ -889,8 +889,8 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 				lastSeen = rec.CreatedAt
 			}
 			if lastSeen.Before(gossipCutoff) {
-				c.emitTombstone(lad.TopicMember, tenant, rec.NodeID, "liveness")
-				c.store.DeleteMember(tenant, rec.NodeID)
+				c.emitTombstone(lad.TopicMember, partition, rec.NodeID, "liveness")
+				c.store.DeleteMember(partition, rec.NodeID)
 				c.store.DeleteGossipSeen(rec.NodeID)
 				removedMembers++
 				// Proactively evict latency records involving this dead node
@@ -908,7 +908,7 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 				// role table, so an orphan renders as a healthy peer that
 				// peers keep dialling: noise-UDP hangs to msg2 timeout, WS
 				// gets 401/404 and falls back to TLS.
-				roleHit := c.evictRoleForNode(tenant, rec.NodeID)
+				roleHit := c.evictRoleForNode(partition, rec.NodeID)
 				removedRoles += roleHit
 				// Report the verdict upward so the transport can attest to it.
 				// Collected here and fired after inMemMu is released: the
@@ -916,17 +916,17 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 				// across a transport call invites deadlock.
 				livenessEvicted = append(livenessEvicted, rec.NodeID)
 				log.Printf("[LIVENESS-EVICT] tenant=%s node=%s lastSeen=%s ageSec=%d latencyEvicted=%d rolesEvicted=%d gossipCutoff=%s",
-					tenant, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, roleHit, gossipCutoff.UTC().Format(time.RFC3339))
+					partition, rec.NodeID, lastSeen.UTC().Format(time.RFC3339), int(now.Sub(lastSeen).Seconds()), latencyHit, roleHit, gossipCutoff.UTC().Format(time.RFC3339))
 			}
 		}
 	}
 
-	// --- Enforce per-tenant cap on member records ---
+	// --- Enforce per-partition cap on member records ---
 	// Self is also exempt from cap eviction for the same reason:
 	// a capacity-tombstone on self suppresses future self-announces.
 	allMembers = c.store.AllMembers()
-	for tenant, members := range allMembers {
-		if len(members) > maxRecordsPerTenant {
+	for partition, members := range allMembers {
+		if len(members) > maxRecordsPerPartition {
 			type memberEntry struct {
 				nodeID    string
 				createdAt time.Time
@@ -943,14 +943,14 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 			})
 			// Recompute excess against the (possibly smaller) non-self set.
 			nonSelf := len(entries)
-			overCap := len(members) - maxRecordsPerTenant
+			overCap := len(members) - maxRecordsPerPartition
 			excess := overCap
 			if excess > nonSelf {
 				excess = nonSelf
 			}
 			for i := 0; i < excess; i++ {
-				c.emitTombstone(lad.TopicMember, tenant, entries[i].nodeID, "cap")
-				c.store.DeleteMember(tenant, entries[i].nodeID)
+				c.emitTombstone(lad.TopicMember, partition, entries[i].nodeID, "cap")
+				c.store.DeleteMember(partition, entries[i].nodeID)
 				removedMembers++
 			}
 		}
@@ -961,7 +961,7 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	// own reach record, or a stale local entry vanishes from its peers
 	// and can't be revived by future self-announcements.
 	allReach := c.store.AllReach()
-	for tenant, records := range allReach {
+	for partition, records := range allReach {
 		for _, rec := range records {
 			if c.localNodeID != "" && rec.NodeID == c.localNodeID {
 				continue
@@ -980,8 +980,8 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 			}
 			if !rec.ExpiresAt.IsZero() {
 				if rec.ExpiresAt.Before(now) {
-					c.emitTombstone(lad.TopicReach, tenant, rec.NodeID, "liveness")
-					c.store.DeleteReach(tenant, rec.NodeID)
+					c.emitTombstone(lad.TopicReach, partition, rec.NodeID, "liveness")
+					c.store.DeleteReach(partition, rec.NodeID)
 					removedReach++
 				}
 				continue
@@ -991,17 +991,17 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 				lastSeen = rec.UpdatedAt
 			}
 			if lastSeen.Before(gossipCutoff) {
-				c.emitTombstone(lad.TopicReach, tenant, rec.NodeID, "liveness")
-				c.store.DeleteReach(tenant, rec.NodeID)
+				c.emitTombstone(lad.TopicReach, partition, rec.NodeID, "liveness")
+				c.store.DeleteReach(partition, rec.NodeID)
 				removedReach++
 			}
 		}
 	}
 
-	// --- Enforce per-tenant cap on reach records ---
+	// --- Enforce per-partition cap on reach records ---
 	allReach = c.store.AllReach()
-	for tenant, records := range allReach {
-		if len(records) > maxRecordsPerTenant {
+	for partition, records := range allReach {
+		if len(records) > maxRecordsPerPartition {
 			type reachEntry struct {
 				nodeID    string
 				updatedAt time.Time
@@ -1017,14 +1017,14 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 				return entries[i].updatedAt.Before(entries[j].updatedAt)
 			})
 			nonSelf := len(entries)
-			overCap := len(records) - maxRecordsPerTenant
+			overCap := len(records) - maxRecordsPerPartition
 			excess := overCap
 			if excess > nonSelf {
 				excess = nonSelf
 			}
 			for i := 0; i < excess; i++ {
-				c.emitTombstone(lad.TopicReach, tenant, entries[i].nodeID, "cap")
-				c.store.DeleteReach(tenant, entries[i].nodeID)
+				c.emitTombstone(lad.TopicReach, partition, entries[i].nodeID, "cap")
+				c.store.DeleteReach(partition, entries[i].nodeID)
 				removedReach++
 			}
 		}
@@ -1088,12 +1088,12 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	// capabilities is worse than an orphan. So this only reaps a role that is
 	// orphaned AND stale AND silent AND not a connected peer — a node that is
 	// merely quiet, or whose member has not arrived yet, keeps its roles.
-	for tenant, roles := range c.store.AllRoles() {
+	for partition, roles := range c.store.AllRoles() {
 		for _, r := range roles {
 			if c.localNodeID != "" && r.NodeID == c.localNodeID {
 				continue
 			}
-			if _, ok := c.store.GetMember(tenant, r.NodeID); ok {
+			if _, ok := c.store.GetMember(partition, r.NodeID); ok {
 				continue // member alive — the cascade owns this role
 			}
 			if c.hasLivenessOverride(r.NodeID) {
@@ -1105,10 +1105,10 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 			if r.Updated.After(gossipCutoff) {
 				continue // refreshed within the liveness window — not yet dead
 			}
-			if hit := c.evictRoleForNode(tenant, r.NodeID); hit > 0 {
+			if hit := c.evictRoleForNode(partition, r.NodeID); hit > 0 {
 				removedRoles += hit
 				log.Printf("[ORPHAN-ROLE-EVICT] tenant=%s node=%s updated=%s ageSec=%d (no member record)",
-					tenant, r.NodeID, r.Updated.UTC().Format(time.RFC3339), int(now.Sub(r.Updated).Seconds()))
+					partition, r.NodeID, r.Updated.UTC().Format(time.RFC3339), int(now.Sub(r.Updated).Seconds()))
 			}
 		}
 	}
@@ -1192,7 +1192,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	// Records with Seq > 0 and Timestamp after (or equal to) tombstone are accepted — this handles
 	// rapid restart scenarios where a node shuts down and comes back within the same second.
 	// Local-only tombstones ("liveness-local") never block — they're just cache cleanup markers.
-	tKey := tombstoneKey(rec.Topic, rec.TenantID, rec.NodeID)
+	tKey := tombstoneKey(rec.Topic, rec.Partition, rec.NodeID)
 	c.inMemMu.RLock()
 	if ts, ok := c.store.GetTombstone(tKey); ok {
 		if ts.TombstoneReason == "liveness-local" {
@@ -1237,7 +1237,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			return err
 		}
 		c.inMemMu.RLock()
-		_, exists := c.store.GetMember(member.TenantID, member.NodeID)
+		_, exists := c.store.GetMember(member.Partition, member.NodeID)
 		c.inMemMu.RUnlock()
 		isNew = !exists
 		isMemberChange = isNew
@@ -1248,7 +1248,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			return err
 		}
 		c.inMemMu.RLock()
-		_, exists := c.store.GetRole(role.TenantID, role.NodeID)
+		_, exists := c.store.GetRole(role.Partition, role.NodeID)
 		c.inMemMu.RUnlock()
 		isNew = !exists
 		c.storeRole(role)
@@ -1267,10 +1267,10 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			c.inMemMu.RLock()
 			applier := c.reachDeltaApplier
 			var baseBody []byte
-			if tenantMap, ok := c.lastReachBody[peek.TenantID]; ok {
-				baseBody = tenantMap[peek.NodeID]
+			if partitionMap, ok := c.lastReachBody[peek.Partition]; ok {
+				baseBody = partitionMap[peek.NodeID]
 			}
-			_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
+			_, exists := c.store.GetReach(peek.Partition, peek.NodeID)
 			c.inMemMu.RUnlock()
 			if applier == nil || baseBody == nil {
 				return nil
@@ -1290,18 +1290,18 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			rebuilt.Seq = rec.Seq
 			isNew = !exists
 			c.storeReach(rebuilt)
-			c.setLastReachBody(rebuilt.TenantID, rebuilt.NodeID, newBody)
+			c.setLastReachBody(rebuilt.Partition, rebuilt.NodeID, newBody)
 			break
 		}
 		// Full snapshot path.
 		peek.UpdatedAt = rec.Timestamp
 		peek.Seq = rec.Seq
 		c.inMemMu.RLock()
-		_, exists := c.store.GetReach(peek.TenantID, peek.NodeID)
+		_, exists := c.store.GetReach(peek.Partition, peek.NodeID)
 		c.inMemMu.RUnlock()
 		isNew = !exists
 		c.storeReach(peek)
-		c.setLastReachBody(peek.TenantID, peek.NodeID, rec.Body)
+		c.setLastReachBody(peek.Partition, peek.NodeID, rec.Body)
 	case lad.TopicLatency:
 		lat, err := lad.UnmarshalLatency(rec.Body)
 		if err != nil {
@@ -1386,7 +1386,7 @@ func (c *DirectoryCache) applyTombstone(rec lad.Record) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
 
-	tKey := tombstoneKey(rec.Topic, rec.TenantID, rec.NodeID)
+	tKey := tombstoneKey(rec.Topic, rec.Partition, rec.NodeID)
 
 	// Only store if this tombstone is newer than any existing one for the same key
 	if existing, ok := c.store.GetTombstone(tKey); ok {
@@ -1399,11 +1399,11 @@ func (c *DirectoryCache) applyTombstone(rec lad.Record) {
 	// Delete matching record from live cache maps
 	switch rec.Topic {
 	case lad.TopicMember:
-		c.store.DeleteMember(rec.TenantID, rec.NodeID)
+		c.store.DeleteMember(rec.Partition, rec.NodeID)
 	case lad.TopicRole:
-		c.store.DeleteRole(rec.TenantID, rec.NodeID)
+		c.store.DeleteRole(rec.Partition, rec.NodeID)
 	case lad.TopicReach:
-		c.store.DeleteReach(rec.TenantID, rec.NodeID)
+		c.store.DeleteReach(rec.Partition, rec.NodeID)
 	case lad.TopicLatency:
 		// For latency tombstones, NodeID holds the latency composite key
 		c.store.DeleteLatency(rec.NodeID)
@@ -1444,7 +1444,7 @@ func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
 	defer c.inMemMu.Unlock()
 
 	// Newer-wins with generic attr merging: preserve all non-empty attrs from the richer record.
-	if existing, ok := c.store.GetMember(member.TenantID, member.NodeID); ok {
+	if existing, ok := c.store.GetMember(member.Partition, member.NodeID); ok {
 		if member.CreatedAt.Before(existing.CreatedAt) {
 			// Incoming is older — merge richer attrs INTO existing
 			merged := false
@@ -1458,7 +1458,7 @@ func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
 				}
 			}
 			if merged {
-				c.store.PutMember(member.TenantID, existing)
+				c.store.PutMember(member.Partition, existing)
 			}
 			return
 		}
@@ -1474,25 +1474,25 @@ func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
 			}
 		}
 	}
-	c.store.PutMember(member.TenantID, member)
+	c.store.PutMember(member.Partition, member)
 }
 
 func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
-	c.store.PutRole(role.TenantID, role)
+	c.store.PutRole(role.Partition, role)
 }
 
 // GetLastReachBody returns a copy of the most recent full-snapshot body
-// for (tenant, nodeID), or nil if none is cached. Exposed so the reach
+// for (partition, nodeID), or nil if none is cached. Exposed so the reach
 // package's FreshnessClient can compute the cached address-set digest
 // and decide whether to ignore or act on an incoming announce.
 //
 // The returned slice is a private copy; callers may mutate it freely.
-func (c *DirectoryCache) GetLastReachBody(tenant, nodeID string) []byte {
+func (c *DirectoryCache) GetLastReachBody(partition, nodeID string) []byte {
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
-	tm, ok := c.lastReachBody[tenant]
+	tm, ok := c.lastReachBody[partition]
 	if !ok {
 		return nil
 	}
@@ -1506,9 +1506,9 @@ func (c *DirectoryCache) GetLastReachBody(tenant, nodeID string) []byte {
 }
 
 // setLastReachBody stores the raw body of the most recent full-snapshot
-// ReachRecord for (tenant, nodeID) so delta applies have a base to rebuild
+// ReachRecord for (partition, nodeID) so delta applies have a base to rebuild
 // from. Caller must not hold c.inMemMu.
-func (c *DirectoryCache) setLastReachBody(tenant, nodeID string, body []byte) {
+func (c *DirectoryCache) setLastReachBody(partition, nodeID string, body []byte) {
 	if len(body) == 0 {
 		return
 	}
@@ -1517,10 +1517,10 @@ func (c *DirectoryCache) setLastReachBody(tenant, nodeID string, body []byte) {
 	if c.lastReachBody == nil {
 		c.lastReachBody = make(map[string]map[string][]byte)
 	}
-	tm, ok := c.lastReachBody[tenant]
+	tm, ok := c.lastReachBody[partition]
 	if !ok {
 		tm = make(map[string][]byte)
-		c.lastReachBody[tenant] = tm
+		c.lastReachBody[partition] = tm
 	}
 	// Copy so we don't retain a caller-controlled buffer.
 	dup := make([]byte, len(body))
@@ -1538,7 +1538,7 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 	// If a record already exists for this NodeID, only replace it if the
 	// incoming record is newer (higher Seq or later UpdatedAt). This
 	// prevents stale gossip from overwriting fresher state.
-	if existing, ok := c.store.GetReach(reach.TenantID, reach.NodeID); ok {
+	if existing, ok := c.store.GetReach(reach.Partition, reach.NodeID); ok {
 		if reach.Seq < existing.Seq {
 			return
 		}
@@ -1546,10 +1546,10 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 			return
 		}
 	}
-	c.store.PutReach(reach.TenantID, reach)
+	c.store.PutReach(reach.Partition, reach)
 }
 
-// Members returns the registered members for a tenant.
+// Members returns the registered members for a partition.
 //
 // The cache unifies two sources into a single view:
 //   - Persisted MemberRecord entries (explicit Append of TopicMember)
@@ -1566,19 +1566,19 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 // a MemberRecord (e.g. agents storing peer-info) keep full control. Nodes
 // that only publish Reach get a Member view for free, with no separate
 // publish path and no TTL drift.
-func (c *DirectoryCache) Members(ctx context.Context, tenant string) ([]lad.MemberRecord, error) {
+func (c *DirectoryCache) Members(ctx context.Context, partition string) ([]lad.MemberRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
-	persisted := c.store.ListMembers(tenant)
+	persisted := c.store.ListMembers(partition)
 	seen := make(map[string]struct{}, len(persisted))
 	for _, m := range persisted {
 		seen[m.NodeID] = struct{}{}
 	}
 	result := persisted
-	for _, reach := range c.store.ListReach(tenant) {
+	for _, reach := range c.store.ListReach(partition) {
 		if _, ok := seen[reach.NodeID]; ok {
 			continue
 		}
@@ -1590,7 +1590,7 @@ func (c *DirectoryCache) Members(ctx context.Context, tenant string) ([]lad.Memb
 			attrs[k] = v
 		}
 		result = append(result, lad.MemberRecord{
-			TenantID:  reach.TenantID,
+			Partition: reach.Partition,
 			NodeID:    reach.NodeID,
 			CreatedAt: reach.UpdatedAt,
 			ExpiresAt: reach.ExpiresAt,
@@ -1602,13 +1602,13 @@ func (c *DirectoryCache) Members(ctx context.Context, tenant string) ([]lad.Memb
 }
 
 // Roles returns role assignments that match the query.
-func (c *DirectoryCache) Roles(ctx context.Context, tenant string, query RoleQuery) ([]lad.RoleRecord, error) {
+func (c *DirectoryCache) Roles(ctx context.Context, partition string, query RoleQuery) ([]lad.RoleRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
-	entries := c.store.ListRoles(tenant)
+	entries := c.store.ListRoles(partition)
 	result := make([]lad.RoleRecord, 0)
 	for _, role := range entries {
 		if query.NodeID != "" && role.NodeID != query.NodeID {
@@ -1627,13 +1627,13 @@ func (c *DirectoryCache) Roles(ctx context.Context, tenant string, query RoleQue
 }
 
 // Reach returns reachability advertisements honouring the provided query.
-func (c *DirectoryCache) Reach(ctx context.Context, tenant string, query ReachQuery) ([]lad.ReachRecord, error) {
+func (c *DirectoryCache) Reach(ctx context.Context, partition string, query ReachQuery) ([]lad.ReachRecord, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
-	entries := c.store.ListReach(tenant)
+	entries := c.store.ListReach(partition)
 	if len(entries) == 0 {
 		return nil, nil
 	}
@@ -1645,7 +1645,7 @@ func (c *DirectoryCache) Reach(ctx context.Context, tenant string, query ReachQu
 		}
 		// Filter by Role
 		if query.Role != "" {
-			role, _ := c.store.GetRole(tenant, reach.NodeID)
+			role, _ := c.store.GetRole(partition, reach.NodeID)
 			if !roleContains(role, query.Role) {
 				continue
 			}
@@ -1682,11 +1682,11 @@ const RelayRole = "relay"
 // DiscoverRelays finds available relay nodes for NAT traversal.
 // Returns relay nodes sorted by preference: region match, availability, load.
 // This is a convenience wrapper around Reach() with Role="relay".
-func (c *DirectoryCache) DiscoverRelays(ctx context.Context, tenant, preferRegion string, limit int) ([]lad.ReachRecord, error) {
+func (c *DirectoryCache) DiscoverRelays(ctx context.Context, partition, preferRegion string, limit int) ([]lad.ReachRecord, error) {
 	if limit <= 0 {
 		limit = 5 // Default: return top 5 relays
 	}
-	return c.Reach(ctx, tenant, ReachQuery{
+	return c.Reach(ctx, partition, ReachQuery{
 		Role:         RelayRole,
 		PreferRegion: preferRegion,
 		MinHealth:    0.5, // Require at least 50% availability for relays
@@ -1751,7 +1751,7 @@ func handlerContains(record lad.RoleRecord, handler string) bool {
 
 // QueryHandlerMetadata searches for a handler across all nodes with the specified role
 // Returns handler metadata including auth requirements and scopes
-func (c *DirectoryCache) QueryHandlerMetadata(ctx context.Context, tenant, handlerName string) (*lad.HandlerMetadata, error) {
+func (c *DirectoryCache) QueryHandlerMetadata(ctx context.Context, partition, handlerName string) (*lad.HandlerMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -1767,7 +1767,7 @@ func (c *DirectoryCache) QueryHandlerMetadata(ctx context.Context, tenant, handl
 	defer c.inMemMu.RUnlock()
 
 	// Search role records for nodes with this role
-	entries := c.store.ListRoles(tenant)
+	entries := c.store.ListRoles(partition)
 	for _, roleRecord := range entries {
 		if !roleContains(roleRecord, role) {
 			continue
@@ -1819,12 +1819,12 @@ func (c *DirectoryCache) evictLatencyForNode(nodeID string) int {
 // "liveness-local", so the tombstone blocks gossip from re-inserting the stale
 // role locally without propagating an eviction that would suppress the node's
 // own re-announcement after a restart.
-func (c *DirectoryCache) evictRoleForNode(tenant, nodeID string) int {
-	if _, ok := c.store.GetRole(tenant, nodeID); !ok {
+func (c *DirectoryCache) evictRoleForNode(partition, nodeID string) int {
+	if _, ok := c.store.GetRole(partition, nodeID); !ok {
 		return 0
 	}
-	c.store.DeleteRole(tenant, nodeID)
-	c.emitTombstone(lad.TopicRole, tenant, nodeID, "liveness")
+	c.store.DeleteRole(partition, nodeID)
+	c.emitTombstone(lad.TopicRole, partition, nodeID, "liveness")
 	return 1
 }
 
@@ -1914,7 +1914,7 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 			body, _ := json.Marshal(m)
 			rec := lad.Record{
 				Topic:     lad.TopicMember,
-				TenantID:  m.TenantID,
+				Partition: m.Partition,
 				NodeID:    m.NodeID,
 				Body:      body,
 				Timestamp: m.CreatedAt,
@@ -1933,7 +1933,7 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 			body, _ := json.Marshal(r)
 			rec := lad.Record{
 				Topic:     lad.TopicRole,
-				TenantID:  r.TenantID,
+				Partition: r.Partition,
 				NodeID:    r.NodeID,
 				Body:      body,
 				Timestamp: r.Updated,
@@ -1952,7 +1952,7 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 			body, _ := json.Marshal(r)
 			rec := lad.Record{
 				Topic:     lad.TopicReach,
-				TenantID:  r.TenantID,
+				Partition: r.Partition,
 				NodeID:    r.NodeID,
 				Seq:       r.Seq,
 				Body:      body,
@@ -2062,7 +2062,7 @@ func (c *DirectoryCache) Dump() []lad.Record {
 			body, _ := json.Marshal(m)
 			rec := lad.Record{
 				Topic:     lad.TopicMember,
-				TenantID:  m.TenantID,
+				Partition: m.Partition,
 				NodeID:    m.NodeID,
 				Body:      body,
 				Timestamp: m.CreatedAt,
@@ -2078,7 +2078,7 @@ func (c *DirectoryCache) Dump() []lad.Record {
 			body, _ := json.Marshal(r)
 			rec := lad.Record{
 				Topic:     lad.TopicRole,
-				TenantID:  r.TenantID,
+				Partition: r.Partition,
 				NodeID:    r.NodeID,
 				Body:      body,
 				Timestamp: r.Updated,
@@ -2098,7 +2098,7 @@ func (c *DirectoryCache) Dump() []lad.Record {
 			body, _ := json.Marshal(r)
 			rec := lad.Record{
 				Topic:     lad.TopicReach,
-				TenantID:  r.TenantID,
+				Partition: r.Partition,
 				NodeID:    r.NodeID,
 				Seq:       r.Seq,
 				Body:      body,
@@ -2144,19 +2144,19 @@ func (c *DirectoryCache) Fingerprint() uint64 {
 
 	var fp uint64
 
-	for tenant, members := range c.store.AllMembers() {
+	for partition, members := range c.store.AllMembers() {
 		for _, m := range members {
-			fp ^= hashKey(fmt.Sprintf("member:%s:%s", tenant, m.NodeID))
+			fp ^= hashKey(fmt.Sprintf("member:%s:%s", partition, m.NodeID))
 		}
 	}
-	for tenant, roles := range c.store.AllRoles() {
+	for partition, roles := range c.store.AllRoles() {
 		for _, r := range roles {
-			fp ^= hashKey(fmt.Sprintf("role:%s:%s", tenant, r.NodeID))
+			fp ^= hashKey(fmt.Sprintf("role:%s:%s", partition, r.NodeID))
 		}
 	}
-	for tenant, reachRecords := range c.store.AllReach() {
+	for partition, reachRecords := range c.store.AllReach() {
 		for _, r := range reachRecords {
-			fp ^= hashKey(fmt.Sprintf("reach:%s:%s", tenant, r.NodeID))
+			fp ^= hashKey(fmt.Sprintf("reach:%s:%s", partition, r.NodeID))
 		}
 	}
 	for key := range c.store.AllLatency() {
@@ -2194,21 +2194,21 @@ func (c *DirectoryCache) BucketDigest(buckets uint16) []uint64 {
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
 
-	for tenant, members := range c.store.AllMembers() {
+	for partition, members := range c.store.AllMembers() {
 		for _, m := range members {
-			h := hashKey(fmt.Sprintf("member:%s:%s", tenant, m.NodeID))
+			h := hashKey(fmt.Sprintf("member:%s:%s", partition, m.NodeID))
 			out[h%n] ^= h
 		}
 	}
-	for tenant, roles := range c.store.AllRoles() {
+	for partition, roles := range c.store.AllRoles() {
 		for _, r := range roles {
-			h := hashKey(fmt.Sprintf("role:%s:%s", tenant, r.NodeID))
+			h := hashKey(fmt.Sprintf("role:%s:%s", partition, r.NodeID))
 			out[h%n] ^= h
 		}
 	}
-	for tenant, reachRecords := range c.store.AllReach() {
+	for partition, reachRecords := range c.store.AllReach() {
 		for _, r := range reachRecords {
-			h := hashKey(fmt.Sprintf("reach:%s:%s", tenant, r.NodeID))
+			h := hashKey(fmt.Sprintf("reach:%s:%s", partition, r.NodeID))
 			out[h%n] ^= h
 		}
 	}
@@ -2257,38 +2257,38 @@ func (c *DirectoryCache) DumpBuckets(buckets uint16, want []bool) []lad.Record {
 	var records []lad.Record
 	now := time.Now()
 
-	for tenant, members := range c.store.AllMembers() {
+	for partition, members := range c.store.AllMembers() {
 		for _, m := range members {
-			if !wanted(fmt.Sprintf("member:%s:%s", tenant, m.NodeID)) {
+			if !wanted(fmt.Sprintf("member:%s:%s", partition, m.NodeID)) {
 				continue
 			}
 			body, _ := json.Marshal(m)
-			rec := lad.Record{Topic: lad.TopicMember, TenantID: m.TenantID, NodeID: m.NodeID, Body: body, Timestamp: m.CreatedAt}
+			rec := lad.Record{Topic: lad.TopicMember, Partition: m.Partition, NodeID: m.NodeID, Body: body, Timestamp: m.CreatedAt}
 			signEnvelope(&rec)
 			records = append(records, rec)
 		}
 	}
-	for tenant, roles := range c.store.AllRoles() {
+	for partition, roles := range c.store.AllRoles() {
 		for _, r := range roles {
-			if !wanted(fmt.Sprintf("role:%s:%s", tenant, r.NodeID)) {
+			if !wanted(fmt.Sprintf("role:%s:%s", partition, r.NodeID)) {
 				continue
 			}
 			body, _ := json.Marshal(r)
-			rec := lad.Record{Topic: lad.TopicRole, TenantID: r.TenantID, NodeID: r.NodeID, Body: body, Timestamp: r.Updated}
+			rec := lad.Record{Topic: lad.TopicRole, Partition: r.Partition, NodeID: r.NodeID, Body: body, Timestamp: r.Updated}
 			signEnvelope(&rec)
 			records = append(records, rec)
 		}
 	}
-	for tenant, reachRecords := range c.store.AllReach() {
+	for partition, reachRecords := range c.store.AllReach() {
 		for _, r := range reachRecords {
 			if !r.ExpiresAt.IsZero() && r.ExpiresAt.Before(now) {
 				continue
 			}
-			if !wanted(fmt.Sprintf("reach:%s:%s", tenant, r.NodeID)) {
+			if !wanted(fmt.Sprintf("reach:%s:%s", partition, r.NodeID)) {
 				continue
 			}
 			body, _ := json.Marshal(r)
-			rec := lad.Record{Topic: lad.TopicReach, TenantID: r.TenantID, NodeID: r.NodeID, Seq: r.Seq, Body: body, Timestamp: r.UpdatedAt}
+			rec := lad.Record{Topic: lad.TopicReach, Partition: r.Partition, NodeID: r.NodeID, Seq: r.Seq, Body: body, Timestamp: r.UpdatedAt}
 			signEnvelope(&rec)
 			records = append(records, rec)
 		}
@@ -2329,11 +2329,11 @@ func (c *DirectoryCache) PruneExpired() (int, error) {
 	removed := 0
 
 	// Members with ExpiresAt
-	for tenant, members := range c.store.AllMembers() {
+	for partition, members := range c.store.AllMembers() {
 		for _, m := range members {
 			if !m.ExpiresAt.IsZero() && now.After(m.ExpiresAt) {
-				c.emitTombstone(lad.TopicMember, tenant, m.NodeID, "ttl")
-				c.store.DeleteMember(tenant, m.NodeID)
+				c.emitTombstone(lad.TopicMember, partition, m.NodeID, "ttl")
+				c.store.DeleteMember(partition, m.NodeID)
 				if c.metrics != nil {
 					c.metrics.RecordExpired(string(lad.TopicMember))
 				}
@@ -2343,11 +2343,11 @@ func (c *DirectoryCache) PruneExpired() (int, error) {
 	}
 
 	// Reach with ExpiresAt
-	for tenant, reachRecords := range c.store.AllReach() {
+	for partition, reachRecords := range c.store.AllReach() {
 		for _, r := range reachRecords {
 			if !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt) {
-				c.emitTombstone(lad.TopicReach, tenant, r.NodeID, "ttl")
-				c.store.DeleteReach(tenant, r.NodeID)
+				c.emitTombstone(lad.TopicReach, partition, r.NodeID, "ttl")
+				c.store.DeleteReach(partition, r.NodeID)
 				if c.metrics != nil {
 					c.metrics.RecordExpired(string(lad.TopicReach))
 				}
@@ -2389,7 +2389,7 @@ func (c *DirectoryCache) ChangesSinceHLC(topic lad.Topic, since uint64) ([]lad.R
 				body, _ := json.Marshal(m)
 				rec := lad.Record{
 					Topic:        lad.TopicMember,
-					TenantID:     m.TenantID,
+					Partition:    m.Partition,
 					NodeID:       m.NodeID,
 					Body:         body,
 					Timestamp:    m.CreatedAt,
@@ -2407,7 +2407,7 @@ func (c *DirectoryCache) ChangesSinceHLC(topic lad.Topic, since uint64) ([]lad.R
 				body, _ := json.Marshal(r)
 				rec := lad.Record{
 					Topic:     lad.TopicRole,
-					TenantID:  r.TenantID,
+					Partition: r.Partition,
 					NodeID:    r.NodeID,
 					Body:      body,
 					Timestamp: r.Updated,
@@ -2423,7 +2423,7 @@ func (c *DirectoryCache) ChangesSinceHLC(topic lad.Topic, since uint64) ([]lad.R
 				body, _ := json.Marshal(r)
 				rec := lad.Record{
 					Topic:     lad.TopicReach,
-					TenantID:  r.TenantID,
+					Partition: r.Partition,
 					NodeID:    r.NodeID,
 					Seq:       r.Seq,
 					Body:      body,
