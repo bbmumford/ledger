@@ -14,13 +14,13 @@ import (
 	lad "github.com/bbmumford/ledger"
 )
 
-// memberRecord builds a non-tombstone TopicMember record for (tenant,node)
+// memberRecord builds a non-tombstone TopicMember record for (partition,node)
 // stamped with a fresh sequence number and timestamp so applyCore's
 // tombstone-blocking path admits it.
-func memberRecord(t *testing.T, tenant, nodeID string, pub []byte) lad.Record {
+func memberRecord(t *testing.T, partition, nodeID string, pub []byte) lad.Record {
 	t.Helper()
 	body, err := json.Marshal(lad.MemberRecord{
-		TenantID:  tenant,
+		Partition: partition,
 		NodeID:    nodeID,
 		PubKey:    pub,
 		CreatedAt: time.Now().UTC(),
@@ -30,7 +30,7 @@ func memberRecord(t *testing.T, tenant, nodeID string, pub []byte) lad.Record {
 	}
 	return lad.Record{
 		Topic:     lad.TopicMember,
-		TenantID:  tenant,
+		Partition: partition,
 		NodeID:    nodeID,
 		Body:      body,
 		Seq:       1,
@@ -44,7 +44,7 @@ func memberRecord(t *testing.T, tenant, nodeID string, pub []byte) lad.Record {
 // bypasses the ACL and merges. A refactor that routes ApplyLocal through
 // the ACL — or routes Apply around it — breaks this test.
 func TestTrustContract_ACLFiresOnApply_SkippedOnApplyLocal(t *testing.T) {
-	const tenant, node = "t-acme", "vl1_node_a"
+	const partition, node = "t-acme", "vl1_node_a"
 	pub, _, _ := ed25519.GenerateKey(nil)
 
 	// --- Apply: ACL denies → record must NOT be present ---
@@ -52,12 +52,12 @@ func TestTrustContract_ACLFiresOnApply_SkippedOnApplyLocal(t *testing.T) {
 	denyCache.RegisterACL(lad.TopicMember, func(string, []byte, lad.Record) error {
 		return lad.ErrACLDenied
 	})
-	rec := memberRecord(t, tenant, node, pub)
+	rec := memberRecord(t, partition, node, pub)
 
 	if err := denyCache.Apply(rec); !errors.Is(err, lad.ErrACLDenied) {
 		t.Fatalf("Apply with denying ACL: got err %v, want ErrACLDenied", err)
 	}
-	if _, ok := denyCache.Store().GetMember(tenant, node); ok {
+	if _, ok := denyCache.Store().GetMember(partition, node); ok {
 		t.Fatal("Apply was rejected by the ACL but the record reached the store — the ACL gate did not fire before merge")
 	}
 
@@ -66,12 +66,12 @@ func TestTrustContract_ACLFiresOnApply_SkippedOnApplyLocal(t *testing.T) {
 	localCache.RegisterACL(lad.TopicMember, func(string, []byte, lad.Record) error {
 		return lad.ErrACLDenied // identical ACL; ApplyLocal must not consult it
 	})
-	rec2 := memberRecord(t, tenant, node, pub)
+	rec2 := memberRecord(t, partition, node, pub)
 
 	if err := localCache.ApplyLocal(rec2); err != nil {
 		t.Fatalf("ApplyLocal must bypass the ACL: got err %v, want nil", err)
 	}
-	if _, ok := localCache.Store().GetMember(tenant, node); !ok {
+	if _, ok := localCache.Store().GetMember(partition, node); !ok {
 		t.Fatal("ApplyLocal returned nil but the record is absent from the store — the trusted-bridge door failed to merge")
 	}
 }
@@ -85,7 +85,7 @@ func TestTrustContract_ACLFiresOnApply_SkippedOnApplyLocal(t *testing.T) {
 // doc.go — a Go test in this module cannot scan the separate HSTLES
 // Library module, so it is deliberately not attempted here.
 func TestTrustContract_SignedTopicACL_RejectsUnverifiableIngress(t *testing.T) {
-	const tenant = "t-acme"
+	const partition = "t-acme"
 
 	// The signed-topic ACL the Library registers in production: admit iff
 	// the record's Ed25519 signature reproduces over signatureContent.
@@ -103,12 +103,12 @@ func TestTrustContract_SignedTopicACL_RejectsUnverifiableIngress(t *testing.T) {
 	t.Run("correctly_signed_passes", func(t *testing.T) {
 		c := NewDirectoryCache()
 		c.RegisterACL(lad.TopicMember, signedTopicACL)
-		rec := memberRecord(t, tenant, "vl1_signed_ok", pub)
+		rec := memberRecord(t, partition, "vl1_signed_ok", pub)
 		lad.SignRecord(&rec, priv)
 		if err := c.Apply(rec); err != nil {
 			t.Fatalf("correctly-signed record rejected: %v", err)
 		}
-		if _, ok := c.Store().GetMember(tenant, "vl1_signed_ok"); !ok {
+		if _, ok := c.Store().GetMember(partition, "vl1_signed_ok"); !ok {
 			t.Fatal("correctly-signed record not stored")
 		}
 	})
@@ -148,13 +148,13 @@ func TestTrustContract_SignedTopicACL_RejectsUnverifiableIngress(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := NewDirectoryCache()
 			c.RegisterACL(lad.TopicMember, signedTopicACL)
-			rec := memberRecord(t, tenant, tc.node, pub)
+			rec := memberRecord(t, partition, tc.node, pub)
 			tc.corrupt(&rec)
 
 			if err := c.Apply(rec); err == nil {
 				t.Fatalf("Apply admitted an unverifiable %s record — external ingress reached merge without passing the ACL", tc.name)
 			}
-			if _, ok := c.Store().GetMember(tenant, tc.node); ok {
+			if _, ok := c.Store().GetMember(partition, tc.node); ok {
 				t.Fatalf("unverifiable %s record reached the store despite ACL rejection", tc.name)
 			}
 		})

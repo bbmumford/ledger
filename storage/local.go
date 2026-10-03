@@ -56,6 +56,48 @@ func DefaultLedgerConfig() LedgerConfig {
 	}
 }
 
+// RequirePartitionColumn refuses a lad_records table that keeps each record's
+// partition in a tenant_id column. Every statement in this ledger and in loom's
+// mesh ledger reads and writes partition_id, and CREATE TABLE IF NOT EXISTS
+// leaves an existing table as it is, so such a table would fail on the
+// partition_id index. The table is not rewritten: the error tells the operator
+// to delete the ledger database so it is created again. A missing table passes.
+func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(lad_records)`)
+	if err != nil {
+		return fmt.Errorf("lad: read lad_records columns: %w", err)
+	}
+	defer rows.Close()
+
+	var hasTenantColumn, hasPartitionColumn bool
+	for rows.Next() {
+		var (
+			cid        int
+			name, kind string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
+			return fmt.Errorf("lad: read lad_records columns: %w", err)
+		}
+		switch name {
+		case "tenant_id":
+			hasTenantColumn = true
+		case "partition_id":
+			hasPartitionColumn = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("lad: read lad_records columns: %w", err)
+	}
+	if hasTenantColumn && !hasPartitionColumn {
+		return fmt.Errorf("lad: lad_records keeps the partition in a tenant_id column, " +
+			"but this ledger reads partition_id; delete the ledger database so it is created again")
+	}
+	return nil
+}
+
 // NewLocalDBLedger creates a persistent ledger backed by a local embedded libSQL database.
 // Pass DefaultLedgerConfig() for sensible defaults, or customize retention and compaction.
 //
@@ -64,7 +106,7 @@ func DefaultLedgerConfig() LedgerConfig {
 //	CREATE TABLE IF NOT EXISTS lad_records (
 //	    topic TEXT NOT NULL,
 //	    seq INTEGER NOT NULL,
-//	    tenant_id TEXT NOT NULL,
+//	    partition_id TEXT NOT NULL,
 //	    node_id TEXT NOT NULL,
 //	    body TEXT NOT NULL,
 //	    signature BLOB,
@@ -75,20 +117,23 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 	if db == nil {
 		return nil, fmt.Errorf("lad: database connection required")
 	}
+	if err := RequirePartitionColumn(context.Background(), db); err != nil {
+		return nil, err
+	}
 
 	// Initialize schema
 	schema := `
 		CREATE TABLE IF NOT EXISTS lad_records (
 			topic TEXT NOT NULL,
 			seq INTEGER NOT NULL,
-			tenant_id TEXT NOT NULL,
+			partition_id TEXT NOT NULL,
 			node_id TEXT NOT NULL,
 			body TEXT NOT NULL,
 			signature BLOB,
 			timestamp TEXT NOT NULL,
 			PRIMARY KEY (topic, seq)
 		);
-		CREATE INDEX IF NOT EXISTS idx_lad_tenant ON lad_records(tenant_id, topic, seq);
+		CREATE INDEX IF NOT EXISTS idx_lad_partition ON lad_records(partition_id, topic, seq);
 		CREATE INDEX IF NOT EXISTS idx_lad_node ON lad_records(node_id, topic, seq);
 		CREATE INDEX IF NOT EXISTS idx_lad_timestamp ON lad_records(timestamp DESC);
 		
@@ -191,7 +236,7 @@ func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
 
 	// Insert record into database
 	query := `
-		INSERT INTO lad_records (topic, seq, tenant_id, node_id, body, signature, timestamp)
+		INSERT INTO lad_records (topic, seq, partition_id, node_id, body, signature, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
@@ -203,7 +248,7 @@ func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
 	_, err = l.db.ExecContext(ctx, query,
 		string(rec.Topic),
 		rec.Seq,
-		rec.TenantID,
+		rec.Partition,
 		rec.NodeID,
 		string(bodyJSON),
 		rec.Signature,
@@ -261,7 +306,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 
 	// Prepare insert statement
 	stmt, err := tx.PrepareContext(txCtx, `
-		INSERT INTO lad_records (topic, seq, tenant_id, node_id, body, signature, timestamp)
+		INSERT INTO lad_records (topic, seq, partition_id, node_id, body, signature, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -304,7 +349,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 		_, err = stmt.ExecContext(txCtx,
 			string(rec.Topic),
 			rec.Seq,
-			rec.TenantID,
+			rec.Partition,
 			rec.NodeID,
 			string(bodyJSON),
 			rec.Signature,
@@ -370,7 +415,7 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 
 		// Query historical records
 		query := fmt.Sprintf(`
-			SELECT topic, seq, tenant_id, node_id, body, signature, timestamp
+			SELECT topic, seq, partition_id, node_id, body, signature, timestamp
 			FROM lad_records
 			WHERE 1=1 %s
 			ORDER BY timestamp ASC, topic ASC, seq ASC
@@ -386,7 +431,7 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 			var rec lad.Record
 			var topicStr, bodyStr, timestampStr string
 
-			if err := rows.Scan(&topicStr, &rec.Seq, &rec.TenantID, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
+			if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
 				return
 			}
 
@@ -441,7 +486,7 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 // This enables rapid bootstrap of new nodes from existing ledger data.
 func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 	query := `
-		SELECT topic, seq, tenant_id, node_id, body, signature, timestamp
+		SELECT topic, seq, partition_id, node_id, body, signature, timestamp
 		FROM lad_records
 		ORDER BY timestamp ASC, topic ASC, seq ASC
 	`
@@ -463,7 +508,7 @@ func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 			var rec lad.Record
 			var topicStr, bodyStr, timestampStr string
 
-			if err := rows.Scan(&topicStr, &rec.Seq, &rec.TenantID, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
+			if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
 				pw.CloseWithError(err)
 				return
 			}
@@ -697,10 +742,10 @@ func (l *LocalDBLedger) updateBloomFilter(rec lad.Record) {
 	topicFilter := l.bloomMgr.GetOrCreate(fmt.Sprintf("topic:%s", rec.Topic))
 	topicFilter.Add([]byte(fmt.Sprintf("%s:%d", rec.Topic, rec.Seq)))
 
-	// Scope by tenant+topic for efficient tenant queries
-	if rec.TenantID != "" {
-		tenantFilter := l.bloomMgr.GetOrCreate(fmt.Sprintf("tenant:%s:%s", rec.TenantID, rec.Topic))
-		tenantFilter.Add([]byte(fmt.Sprintf("%s:%s:%d", rec.TenantID, rec.Topic, rec.Seq)))
+	// Scope by partition+topic for efficient partition queries
+	if rec.Partition != "" {
+		partitionFilter := l.bloomMgr.GetOrCreate(fmt.Sprintf("partition:%s:%s", rec.Partition, rec.Topic))
+		partitionFilter.Add([]byte(fmt.Sprintf("%s:%s:%d", rec.Partition, rec.Topic, rec.Seq)))
 	}
 
 	// Scope by node for node-specific queries
@@ -815,7 +860,7 @@ func (l *LocalDBLedger) rebuildBloomFilters(ctx context.Context) error {
 
 	// Query all records and rebuild filters
 	rows, err := l.db.QueryContext(ctx, `
-		SELECT topic, seq, tenant_id, node_id FROM lad_records
+		SELECT topic, seq, partition_id, node_id FROM lad_records
 	`)
 	if err != nil {
 		return fmt.Errorf("lad: query for bloom rebuild: %w", err)
@@ -824,18 +869,18 @@ func (l *LocalDBLedger) rebuildBloomFilters(ctx context.Context) error {
 
 	count := 0
 	for rows.Next() {
-		var topic, tenantID, nodeID string
+		var topic, partitionID, nodeID string
 		var seq uint64
-		if err := rows.Scan(&topic, &seq, &tenantID, &nodeID); err != nil {
+		if err := rows.Scan(&topic, &seq, &partitionID, &nodeID); err != nil {
 			continue
 		}
 
 		// Rebuild each scope's filter
 		rec := lad.Record{
-			Topic:    lad.Topic(topic),
-			Seq:      seq,
-			TenantID: tenantID,
-			NodeID:   nodeID,
+			Topic:     lad.Topic(topic),
+			Seq:       seq,
+			Partition: partitionID,
+			NodeID:    nodeID,
 		}
 		l.updateBloomFilter(rec)
 		count++

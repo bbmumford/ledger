@@ -42,14 +42,14 @@ func (cw CausalWatermark) Copy() CausalWatermark {
 type Record struct {
 	Topic           Topic           `json:"topic"`
 	Seq             uint64          `json:"seq"`
-	TenantID        string          `json:"tenantId"`
+	Partition       string          `json:"partition"`
 	NodeID          string          `json:"nodeId"`
 	Body            json.RawMessage `json:"body"`
 	Signature       []byte          `json:"sig"`
 	Timestamp       time.Time       `json:"ts"`
-	LamportClock    uint64          `json:"lc,omitempty"`               // causal ordering
-	HLCTimestamp    uint64          `json:"hlc,omitempty"`              // hybrid logical clock (0 = unused)
-	Tombstone       bool            `json:"tombstone,omitempty"`        // true = deletion marker
+	LamportClock    uint64          `json:"lc,omitempty"`        // causal ordering
+	HLCTimestamp    uint64          `json:"hlc,omitempty"`       // hybrid logical clock (0 = unused)
+	Tombstone       bool            `json:"tombstone,omitempty"` // true = deletion marker
 	DeletedAt       time.Time       `json:"deletedAt,omitempty"`
 	TombstoneReason string          `json:"tombstoneReason,omitempty"` // "explicit", "cap"
 	ExpiresAt       time.Time       `json:"expiresAt,omitempty"`       // TTL expiration (zero = never)
@@ -65,13 +65,42 @@ type MergeFunc func(existing, incoming Record) (Record, error)
 // Default is NodeIDKey (keyed by NodeID). CRDTs use BodyKey.
 type KeyFunc func(Record) string
 
-// OverwriteMerge is the default merge function.
-// Latest timestamp or highest LamportClock wins.
+// OverwriteMerge is the default merge function: highest HLC wins when both
+// records carry one, otherwise the latest Timestamp wins. An exact tie keeps
+// the existing record.
+//
+// It used to key on LamportClock first (#M-614, #R-1594). That clock does not
+// merge — nothing advances it past an observed remote stamp; the estate's
+// merging clock is swarm.HLC.Observe — and it is held in memory, so it RESETS
+// TO 0 ON RESTART. A restarted node's fresh record therefore carried a LOWER
+// clock than its own pre-restart record and lost to it, silently, for as long
+// as any peer held the stale copy. On topics without expiry that is forever.
+//
+// 🪤 The HLC comparison is guarded on BOTH sides being non-zero, and that
+// guard is load-bearing. Records a node publishes about itself carry no HLC;
+// the same record arriving through loom's lad_reach_bridge carries one lifted
+// from the swarm envelope, so a single key can see both shapes. An unguarded
+// "highest HLC wins" would let any HLC-bearing copy beat a local HLC=0 record
+// REGARDLESS OF AGE — trading the restart bug for an echo bug.
+//
+// 🛑 THE TIMESTAMP FALLBACK ASSUMES A KEY HOLDS ONE NODE'S RECORDS (#R-1594
+// ④). That holds for NodeIDKey, which is what all six live topics register,
+// so the comparison is INTRA-NODE and cross-node clock skew never enters it.
+// Under BodyKey — declared here, registered by nobody today — the same
+// fallback becomes a CROSS-NODE comparison and clock skew would order the
+// result, with no test failing. Registering a topic with BodyKey therefore
+// requires revisiting this function, not just that registration.
 func OverwriteMerge(existing, incoming Record) (Record, error) {
-	if incoming.LamportClock > existing.LamportClock {
-		return incoming, nil
+	if incoming.HLCTimestamp != 0 && existing.HLCTimestamp != 0 {
+		if incoming.HLCTimestamp > existing.HLCTimestamp {
+			return incoming, nil
+		}
+		if incoming.HLCTimestamp < existing.HLCTimestamp {
+			return existing, nil
+		}
+		// Equal HLCs fall through to the timestamp comparison below.
 	}
-	if incoming.LamportClock == existing.LamportClock && incoming.Timestamp.After(existing.Timestamp) {
+	if incoming.Timestamp.After(existing.Timestamp) {
 		return incoming, nil
 	}
 	return existing, nil
@@ -102,12 +131,12 @@ type QueryFilter struct {
 
 // TopicConfig configures per-topic behavior.
 type TopicConfig struct {
-	Merge            MergeFunc                                        // conflict resolution (nil = OverwriteMerge)
-	Key              KeyFunc                                          // key derivation (nil = NodeIDKey)
-	ExpiryEnabled    bool                                             // enable TTL expiration
-	RequireSignature bool                                             // reject unsigned records
-	VerifyFunc       func(pubkey, signature, content []byte) bool     // custom signature verifier (nil = Ed25519)
-	SignFunc         func(content []byte) (pubkey, sig []byte)        // for local writes
+	Merge            MergeFunc                                    // conflict resolution (nil = OverwriteMerge)
+	Key              KeyFunc                                      // key derivation (nil = NodeIDKey)
+	ExpiryEnabled    bool                                         // enable TTL expiration
+	RequireSignature bool                                         // reject unsigned records
+	VerifyFunc       func(pubkey, signature, content []byte) bool // custom signature verifier (nil = Ed25519)
+	SignFunc         func(content []byte) (pubkey, sig []byte)    // for local writes
 }
 
 // MetricsRecorder receives operational metrics from the cache.
@@ -129,7 +158,7 @@ type HandlerMetadata struct {
 
 // MemberRecord mirrors the MemberAdd log schema once decoded.
 type MemberRecord struct {
-	TenantID  string            `json:"tenant"`
+	Partition string            `json:"partition"`
 	NodeID    string            `json:"nodeId"`
 	PubKey    []byte            `json:"pubkey"`
 	CreatedAt time.Time         `json:"createdAt"`
@@ -140,12 +169,12 @@ type MemberRecord struct {
 
 // RoleRecord mirrors the RoleSet schema.
 type RoleRecord struct {
-	TenantID string            `json:"tenant"`
-	NodeID   string            `json:"nodeId"`
-	Roles    []string          `json:"roles"`
-	Handlers []HandlerMetadata `json:"handlers,omitempty"` // Handler security metadata
-	MaxGrade int               `json:"maxGrade,omitempty"` // Highest grade this node can support (0-4)
-	Updated  time.Time         `json:"ts"`
+	Partition string            `json:"partition"`
+	NodeID    string            `json:"nodeId"`
+	Roles     []string          `json:"roles"`
+	Handlers  []HandlerMetadata `json:"handlers,omitempty"` // Handler security metadata
+	MaxGrade  int               `json:"maxGrade,omitempty"` // Highest grade this node can support (0-4)
+	Updated   time.Time         `json:"ts"`
 }
 
 // ReachAddress represents a single advertised endpoint.
@@ -173,7 +202,7 @@ func (a ReachAddress) DialAddress() string {
 
 // ReachRecord mirrors the ReachSet schema plus derived metrics.
 type ReachRecord struct {
-	TenantID      string         `json:"tenant"`
+	Partition     string         `json:"partition"`
 	NodeID        string         `json:"nodeId"`
 	Seq           uint64         `json:"seq"`
 	Addresses     []ReachAddress `json:"addrs"`
@@ -227,9 +256,9 @@ func (r ReachRecord) LatencyDuration() time.Duration {
 type LatencyRecord struct {
 	FromNode     string    `json:"fromNode"`
 	ToNode       string    `json:"toNode"`
-	RTTMs        int64     `json:"rttMs"`                        // Application RTT (gossip/data exchange latency)
-	InitialRTTMs int64     `json:"initialRttMs,omitempty"`      // Network RTT (connection setup latency)
-	Transport    string    `json:"transport,omitempty"`            // "noise-udp" or "gossip-tls"
+	RTTMs        int64     `json:"rttMs"`                  // Application RTT (gossip/data exchange latency)
+	InitialRTTMs int64     `json:"initialRttMs,omitempty"` // Network RTT (connection setup latency)
+	Transport    string    `json:"transport,omitempty"`    // "noise-udp" or "gossip-tls"
 	MeasuredAt   time.Time `json:"measuredAt"`
 	ExpiresAt    time.Time `json:"expiresAt"`
 }

@@ -23,7 +23,7 @@ func TestSignRecordVerifyRoundtrip(t *testing.T) {
 	rec := Record{
 		Topic:        "test.topic",
 		NodeID:       "vl1_test",
-		TenantID:     "tenant-a",
+		Partition:    "tenant-a",
 		Body:         []byte(`{"hello":"world"}`),
 		Timestamp:    time.Date(2026, 6, 4, 12, 0, 0, 123456789, time.UTC),
 		LamportClock: 42,

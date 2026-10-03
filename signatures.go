@@ -48,7 +48,7 @@ func VerifyRecord(rec Record) bool {
 //
 // Fields signed (in order):
 //
-//	Topic, NodeID, TenantID, Body
+//	Topic, NodeID, Partition, Body
 //	Timestamp (RFC3339Nano)
 //	LamportClock (BE u64)
 //	Seq (BE u64)
@@ -67,7 +67,7 @@ func signatureContent(rec *Record) []byte {
 	buf = append(buf, sep...)
 	buf = append(buf, []byte(rec.NodeID)...)
 	buf = append(buf, sep...)
-	buf = append(buf, []byte(rec.TenantID)...)
+	buf = append(buf, []byte(rec.Partition)...)
 	buf = append(buf, sep...)
 	buf = appendLenPrefixed(buf, rec.Body)
 

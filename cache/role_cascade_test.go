@@ -39,9 +39,9 @@ import (
 // definition, so it dies with the member.
 func TestEvictExpired_CascadesRolesForDeadNode(t *testing.T) {
 	const (
-		tenant = "t1"
-		ghost  = "vl1_ghostnode"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		ghost     = "vl1_ghostnode"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
@@ -50,27 +50,27 @@ func TestEvictExpired_CascadesRolesForDeadNode(t *testing.T) {
 	// A node last seen well beyond GossipLivenessTimeout (16m) — i.e. the
 	// member sweep will liveness-evict it on this very pass.
 	dead := time.Now().Add(-2 * GossipLivenessTimeout)
-	c.store.PutMember(tenant, lad.MemberRecord{
-		TenantID:  tenant,
+	c.store.PutMember(partition, lad.MemberRecord{
+		Partition: partition,
 		NodeID:    ghost,
 		CreatedAt: dead,
 	})
-	c.store.PutRole(tenant, lad.RoleRecord{
-		TenantID: tenant,
-		NodeID:   ghost,
-		Roles:    []string{"relay"},
-		Updated:  dead,
+	c.store.PutRole(partition, lad.RoleRecord{
+		Partition: partition,
+		NodeID:    ghost,
+		Roles:     []string{"relay"},
+		Updated:   dead,
 	})
 
 	c.EvictExpired()
 
 	// Baseline: the member sweep works today. If this fails the test is not
 	// exercising what it claims and the role assertion below proves nothing.
-	if _, ok := c.store.GetMember(tenant, ghost); ok {
+	if _, ok := c.store.GetMember(partition, ghost); ok {
 		t.Fatal("precondition: member was not liveness-evicted — test is not exercising the sweep")
 	}
 
-	if _, ok := c.store.GetRole(tenant, ghost); ok {
+	if _, ok := c.store.GetRole(partition, ghost); ok {
 		t.Fatal("role record SURVIVED liveness eviction of its member — orphaned role " +
 			"keeps a dead node in mesh-topology machines[] forever; peers keep dialling it " +
 			"(noise-UDP msg2 timeout, WS 401/404 -> TLS fallback)")
@@ -97,9 +97,9 @@ func TestEvictExpired_CascadesRolesForDeadNode(t *testing.T) {
 // that regressed — which is exactly why it re-enters the cache on purpose.
 func TestEvictExpired_OnLivenessEvict_FiresForDeadNodeOutsideLock(t *testing.T) {
 	const (
-		tenant = "t1"
-		ghost  = "vl1_ghostnode"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		ghost     = "vl1_ghostnode"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
@@ -115,7 +115,7 @@ func TestEvictExpired_OnLivenessEvict_FiresForDeadNodeOutsideLock(t *testing.T) 
 	})
 
 	dead := time.Now().Add(-2 * GossipLivenessTimeout)
-	c.store.PutMember(tenant, lad.MemberRecord{TenantID: tenant, NodeID: ghost, CreatedAt: dead})
+	c.store.PutMember(partition, lad.MemberRecord{Partition: partition, NodeID: ghost, CreatedAt: dead})
 
 	c.EvictExpired()
 
@@ -132,9 +132,9 @@ func TestEvictExpired_OnLivenessEvict_FiresForDeadNodeOutsideLock(t *testing.T) 
 // dead; attesting against a live node is the cascade the quorum exists to stop.
 func TestEvictExpired_OnLivenessEvict_SilentForLiveNode(t *testing.T) {
 	const (
-		tenant = "t1"
-		live   = "vl1_livenode"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		live      = "vl1_livenode"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
@@ -144,7 +144,7 @@ func TestEvictExpired_OnLivenessEvict_SilentForLiveNode(t *testing.T) {
 	c.SetOnLivenessEvict(func(string) { fired++ })
 
 	now := time.Now()
-	c.store.PutMember(tenant, lad.MemberRecord{TenantID: tenant, NodeID: live, CreatedAt: now})
+	c.store.PutMember(partition, lad.MemberRecord{Partition: partition, NodeID: live, CreatedAt: now})
 	c.store.PutGossipSeen(live, now)
 
 	c.EvictExpired()
@@ -161,7 +161,7 @@ func TestEvictExpired_OnLivenessEvict_UnsetIsSafe(t *testing.T) {
 	c := NewDirectoryCache()
 	c.SetLocalNodeID("vl1_selfnode")
 	c.store.PutMember("t1", lad.MemberRecord{
-		TenantID:  "t1",
+		Partition: "t1",
 		NodeID:    "vl1_ghost",
 		CreatedAt: time.Now().Add(-2 * GossipLivenessTimeout),
 	})
@@ -177,9 +177,9 @@ func TestEvictExpired_OnLivenessEvict_UnsetIsSafe(t *testing.T) {
 // unreachable by any code path in the process.
 func TestEvictExpired_ReapsAlreadyOrphanedRole(t *testing.T) {
 	const (
-		tenant = "t1"
-		orphan = "vl1_orphannode"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		orphan    = "vl1_orphannode"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
@@ -187,16 +187,16 @@ func TestEvictExpired_ReapsAlreadyOrphanedRole(t *testing.T) {
 
 	// A role with NO member record and no refresh inside the liveness window:
 	// its source node died long ago.
-	c.store.PutRole(tenant, lad.RoleRecord{
-		TenantID: tenant,
-		NodeID:   orphan,
-		Roles:    []string{"relay"},
-		Updated:  time.Now().Add(-2 * GossipLivenessTimeout),
+	c.store.PutRole(partition, lad.RoleRecord{
+		Partition: partition,
+		NodeID:    orphan,
+		Roles:     []string{"relay"},
+		Updated:   time.Now().Add(-2 * GossipLivenessTimeout),
 	})
 
 	c.EvictExpired()
 
-	if _, ok := c.store.GetRole(tenant, orphan); ok {
+	if _, ok := c.store.GetRole(partition, orphan); ok {
 		t.Fatal("pre-existing orphaned role survived — no code path can ever remove it, " +
 			"so it stays in mesh-topology machines[] as a healthy grade-A ghost forever")
 	}
@@ -208,24 +208,24 @@ func TestEvictExpired_ReapsAlreadyOrphanedRole(t *testing.T) {
 // a node that is still arriving, so a freshly-updated role must survive.
 func TestEvictExpired_KeepsFreshOrphanRole(t *testing.T) {
 	const (
-		tenant   = "t1"
-		arriving = "vl1_arriving"
-		self     = "vl1_selfnode"
+		partition = "t1"
+		arriving  = "vl1_arriving"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
 	c.SetLocalNodeID(self)
 
-	c.store.PutRole(tenant, lad.RoleRecord{
-		TenantID: tenant,
-		NodeID:   arriving,
-		Roles:    []string{"relay"},
-		Updated:  time.Now(), // just arrived; member still in flight
+	c.store.PutRole(partition, lad.RoleRecord{
+		Partition: partition,
+		NodeID:    arriving,
+		Roles:     []string{"relay"},
+		Updated:   time.Now(), // just arrived; member still in flight
 	})
 
 	c.EvictExpired()
 
-	if _, ok := c.store.GetRole(tenant, arriving); !ok {
+	if _, ok := c.store.GetRole(partition, arriving); !ok {
 		t.Fatal("freshly-published role evicted before its member arrived — " +
 			"strips a live node of its advertised capabilities, worse than the orphan")
 	}
@@ -236,24 +236,24 @@ func TestEvictExpired_KeepsFreshOrphanRole(t *testing.T) {
 // capabilities from its own directory while perfectly healthy.
 func TestEvictExpired_KeepsSelfRole(t *testing.T) {
 	const (
-		tenant = "t1"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
 	c.SetLocalNodeID(self)
 
 	// Stale AND memberless — reaped for any other node.
-	c.store.PutRole(tenant, lad.RoleRecord{
-		TenantID: tenant,
-		NodeID:   self,
-		Roles:    []string{"anchor"},
-		Updated:  time.Now().Add(-2 * GossipLivenessTimeout),
+	c.store.PutRole(partition, lad.RoleRecord{
+		Partition: partition,
+		NodeID:    self,
+		Roles:     []string{"anchor"},
+		Updated:   time.Now().Add(-2 * GossipLivenessTimeout),
 	})
 
 	c.EvictExpired()
 
-	if _, ok := c.store.GetRole(tenant, self); !ok {
+	if _, ok := c.store.GetRole(partition, self); !ok {
 		t.Fatal("node reaped its OWN role record")
 	}
 }
@@ -264,34 +264,34 @@ func TestEvictExpired_KeepsSelfRole(t *testing.T) {
 // capabilities and is strictly worse than the ghost it fixes.
 func TestEvictExpired_KeepsRolesForLiveNode(t *testing.T) {
 	const (
-		tenant = "t1"
-		live   = "vl1_livenode"
-		self   = "vl1_selfnode"
+		partition = "t1"
+		live      = "vl1_livenode"
+		self      = "vl1_selfnode"
 	)
 
 	c := NewDirectoryCache()
 	c.SetLocalNodeID(self)
 
 	now := time.Now()
-	c.store.PutMember(tenant, lad.MemberRecord{
-		TenantID:  tenant,
+	c.store.PutMember(partition, lad.MemberRecord{
+		Partition: partition,
 		NodeID:    live,
 		CreatedAt: now,
 	})
-	c.store.PutRole(tenant, lad.RoleRecord{
-		TenantID: tenant,
-		NodeID:   live,
-		Roles:    []string{"relay"},
-		Updated:  now,
+	c.store.PutRole(partition, lad.RoleRecord{
+		Partition: partition,
+		NodeID:    live,
+		Roles:     []string{"relay"},
+		Updated:   now,
 	})
 	c.store.PutGossipSeen(live, now)
 
 	c.EvictExpired()
 
-	if _, ok := c.store.GetMember(tenant, live); !ok {
+	if _, ok := c.store.GetMember(partition, live); !ok {
 		t.Fatal("live member was evicted")
 	}
-	if _, ok := c.store.GetRole(tenant, live); !ok {
+	if _, ok := c.store.GetRole(partition, live); !ok {
 		t.Fatal("live node's role was evicted — cascade must fire only with the member sweep")
 	}
 }

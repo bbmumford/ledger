@@ -20,15 +20,15 @@ func TestReachRecord_MetadataRoundTrip(t *testing.T) {
 	// lad.Record.Body. Body is unmarshaled by lad.UnmarshalReach into
 	// lad.ReachRecord and stored in the cache.
 	type reachWithMeta struct {
-		NodeID   string            `json:"nodeId"`
-		TenantID string            `json:"tenant"`
-		Region   string            `json:"region"`
-		Metadata map[string]string `json:"meta,omitempty"`
+		NodeID    string            `json:"nodeId"`
+		Partition string            `json:"partition"`
+		Region    string            `json:"region"`
+		Metadata  map[string]string `json:"meta,omitempty"`
 	}
 	sent := reachWithMeta{
-		NodeID:   "vl1_test",
-		TenantID: "",
-		Region:   "iad",
+		NodeID:    "vl1_test",
+		Partition: "",
+		Region:    "iad",
 		Metadata: map[string]string{
 			"service_name": "devices.orbtr.io",
 			"region":       "iad",
@@ -79,7 +79,7 @@ func TestCache_DeltaApplierRebuildsFullRecord(t *testing.T) {
 
 	// Seed full snapshot.
 	full := lad.ReachRecord{
-		TenantID:  "",
+		Partition: "",
 		NodeID:    "vl1_alice",
 		Region:    "iad",
 		UpdatedAt: time.Now(),
@@ -101,7 +101,7 @@ func TestCache_DeltaApplierRebuildsFullRecord(t *testing.T) {
 	}
 
 	// Send a delta (body shape irrelevant — applier rewrites).
-	deltaBody := []byte(`{"nodeId":"vl1_alice","tenant":"","v":32769,"ops":[]}`)
+	deltaBody := []byte(`{"nodeId":"vl1_alice","partition":"","v":32769,"ops":[]}`)
 	if err := c.Apply(lad.Record{
 		Topic:     lad.TopicReach,
 		NodeID:    "vl1_alice",
@@ -145,7 +145,7 @@ func TestCache_SkipsReachDelta(t *testing.T) {
 
 	// Seed with a full snapshot (has Metadata)
 	full := lad.ReachRecord{
-		TenantID:  "",
+		Partition: "",
 		NodeID:    "vl1_alice",
 		Region:    "iad",
 		UpdatedAt: time.Now(),
@@ -156,10 +156,10 @@ func TestCache_SkipsReachDelta(t *testing.T) {
 	}
 	fullBody, _ := json.Marshal(full)
 	if err := c.Apply(lad.Record{
-		Topic:    lad.TopicReach,
-		NodeID:   "vl1_alice",
-		Body:     fullBody,
-		Seq:      1,
+		Topic:     lad.TopicReach,
+		NodeID:    "vl1_alice",
+		Body:      fullBody,
+		Seq:       1,
 		Timestamp: time.Now(),
 	}); err != nil {
 		t.Fatalf("apply full: %v", err)
@@ -172,12 +172,12 @@ func TestCache_SkipsReachDelta(t *testing.T) {
 	}
 
 	// Send a delta — should be SKIPPED
-	deltaBody := []byte(`{"nodeId":"vl1_alice","tenant":"","v":32769,"hlc":{"wall":0,"logical":0},"ops":[]}`)
+	deltaBody := []byte(`{"nodeId":"vl1_alice","partition":"","v":32769,"hlc":{"wall":0,"logical":0},"ops":[]}`)
 	if err := c.Apply(lad.Record{
-		Topic:    lad.TopicReach,
-		NodeID:   "vl1_alice",
-		Body:     deltaBody,
-		Seq:      2,
+		Topic:     lad.TopicReach,
+		NodeID:    "vl1_alice",
+		Body:      deltaBody,
+		Seq:       2,
 		Timestamp: time.Now().Add(time.Second),
 	}); err != nil {
 		t.Fatalf("apply delta: %v", err)

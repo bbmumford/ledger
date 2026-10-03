@@ -23,9 +23,9 @@ func mustApply(t *testing.T, c *DirectoryCache, topic lad.Topic, v any) {
 	}
 }
 
-func applyMember(t *testing.T, c *DirectoryCache, tenant, node string) {
+func applyMember(t *testing.T, c *DirectoryCache, partition, node string) {
 	mustApply(t, c, lad.TopicMember, lad.MemberRecord{
-		TenantID: tenant, NodeID: node, PubKey: []byte("k-" + node), CreatedAt: time.Now(),
+		Partition: partition, NodeID: node, PubKey: []byte("k-" + node), CreatedAt: time.Now(),
 	})
 }
 
@@ -36,12 +36,12 @@ func populateCache(t *testing.T, c *DirectoryCache) {
 	}
 	for _, n := range []string{"a", "b", "c"} {
 		mustApply(t, c, lad.TopicRole, lad.RoleRecord{
-			TenantID: "tenant-1", NodeID: "role-" + n, Roles: []string{"auth"}, Updated: time.Now(),
+			Partition: "tenant-1", NodeID: "role-" + n, Roles: []string{"auth"}, Updated: time.Now(),
 		})
 	}
 	for _, n := range []string{"a", "b"} {
 		mustApply(t, c, lad.TopicReach, lad.ReachRecord{
-			TenantID: "tenant-1", NodeID: "reach-" + n,
+			Partition: "tenant-1", NodeID: "reach-" + n,
 			Addresses: []lad.ReachAddress{{Host: "10.0.0.1", Port: 8000, Proto: "tcp", Scope: "lan"}},
 			Region:    "iad", ExpiresAt: time.Now().Add(time.Hour),
 		})

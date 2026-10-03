@@ -32,12 +32,12 @@ type ContentHash [ContentHashLen]byte
 
 // ComputeContentHash returns the canonical content hash for a
 // record. Stable across encoder versions: hashes the canonicalised
-// byte representation of (Topic, TenantID, NodeID, Body, HLC,
+// byte representation of (Topic, Partition, NodeID, Body, HLC,
 // Tombstone) — never the signature, never the receive timestamp.
 //
 // The canonical form is fixed at:
 //
-//	[len(topic)|topic][len(tenant)|tenant][len(node)|node]
+//	[len(topic)|topic][len(partition)|partition][len(node)|node]
 //	[len(body)|body][hlc_uint64][tombstone_byte]
 //
 // All length prefixes are big-endian uint32. SHA-256 truncated to
@@ -45,7 +45,7 @@ type ContentHash [ContentHashLen]byte
 func (r Record) ContentHash() ContentHash {
 	h := sha256.New()
 	writeLenPrefixed(h, []byte(r.Topic))
-	writeLenPrefixed(h, []byte(r.TenantID))
+	writeLenPrefixed(h, []byte(r.Partition))
 	writeLenPrefixed(h, []byte(r.NodeID))
 	writeLenPrefixed(h, r.Body)
 	var hlc [8]byte

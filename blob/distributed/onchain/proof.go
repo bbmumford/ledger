@@ -3,14 +3,16 @@
  * Queries: licensing@hstles.com
  */
 
-// Package onchain holds the on-chain proof-of-storage + paid-pinning
-// surface that the rest of the legacy ledger/blob/distributed package
-// no longer needs. The Phase-1 / Phase-2 (chunker, store, advertiser,
-// resolver, fetcher, replicator, abuse, quota, rarest-first) code has
-// moved to github.com/bbmumford/diststore; only the on-chain coupled
-// pieces remain here so the EscrowClient interface + the
-// proof-of-storage challenger / responder can stay close to the
-// PlutusStorageEscrow.sol surface they speak to.
+// Package onchain holds the EVM-coupled storage surfaces: the
+// proof-of-storage challenge/response protocol that resolves into
+// PlutusStorageEscrow.sol slashing, the paid-pinning offer/accept
+// envelopes, and the EscrowClient interface that posts bonds + reports
+// misses to the on-chain contract. Lives in ledger/blob/distributed
+// because it consumes ledger's SealedColumn + KEK primitives and binds
+// to the EVM contract surface; mesh-only blob storage (chunker, store,
+// advertiser, resolver, fetcher, replicator, abuse, quota,
+// rarest-first) is intentionally OUT of this package — it has its own
+// home that does not depend on the EVM contract surface.
 package onchain
 
 // Proof-of-storage challenge/response protocol.
@@ -29,10 +31,10 @@ package onchain
 //   slashes the bond after a 2nd miss in the same week.
 //
 // CHALLENGE FREQUENCY:
-//   ROADMAP.md section 2 specifies an aggregate ~1 challenge per 24h per
-//   pinned CID. Each peer independently rolls at probability
-//   (1 / expectedInterval) × tickRate on each tick. With 24 peers tick-ing
-//   once an hour, the expected aggregate rate across all peers is 1/day.
+//   Target aggregate rate is ~1 challenge per 24h per pinned CID. Each
+//   peer independently rolls at probability (1 / expectedInterval) ×
+//   tickRate on each tick. With 24 peers tick-ing once an hour, the
+//   expected aggregate rate across all peers is 1/day.
 //
 // CRYPTO:
 //   - hash = BLAKE2b-256(piece || nonce) — same primitive used for CIDs.

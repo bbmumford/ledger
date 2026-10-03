@@ -517,7 +517,11 @@ func (p *Pinner) PublishPinRequest(ctx context.Context, req PinRequest) ([]Repli
 
 // ─── Replicator side ──────────────────────────────────────────────
 
-// PinPolicyConfig mirrors the TOML snippet in ROADMAP.md section 2.
+// PinPolicyConfig is the replicator's policy gate: which pin offers it
+// accepts and the per-offer constraints (price floor, size band,
+// commitment window, seller reputation floor, chain preference). The
+// acceptor consults this on every inbound PinOffer before signing a
+// PinAccept envelope and posting bond on-chain.
 type PinPolicyConfig struct {
 	Enabled              bool
 	MaxTotalPinnedBytes  int64
