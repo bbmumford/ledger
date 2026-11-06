@@ -19,7 +19,7 @@ type SnapshotHeader struct {
 	Timestamp int64  `json:"ts"`
 	Sequence  uint64 `json:"seq"`
 	NodeID    string `json:"nodeId"` // ID of the anchor node that generated this
-	Signature []byte `json:"sig"`     // Ed25519 signature of the snapshot content
+	Signature []byte `json:"sig"`    // Ed25519 signature of the snapshot content
 }
 
 // SnapshotContent is the struct used for signing (excludes the signature itself).

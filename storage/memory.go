@@ -89,10 +89,18 @@ func NewMemoryLedger(cfg MemoryLedgerConfig) *MemoryLedger {
 	return ml
 }
 
-// Close stops background goroutines and releases resources.
+// Close stops background goroutines and releases resources. It ends every
+// subscription, so each Stream goroutine hands its consumer what its queue
+// holds and closes its channel; subscribe registers nothing once stopChan is
+// closed.
 func (l *MemoryLedger) Close() error {
 	l.stopOnce.Do(func() {
 		close(l.stopChan)
+		l.mu.Lock()
+		for _, sub := range l.subscribers {
+			sub.end()
+		}
+		l.mu.Unlock()
 		if l.gcTicker != nil {
 			l.gcTicker.Stop()
 		}
@@ -365,42 +373,54 @@ func (l *MemoryLedger) Stream(ctx context.Context, from lad.CausalWatermark, top
 			}
 		}
 
-		// Register subscriber for live updates.
-		sub := &subscriber{
-			ch:     make(chan lad.Record, 64),
-			topics: filter,
+		// Register subscriber for live updates. Close ends the
+		// subscription, and forward hands over what its queue holds before
+		// out closes.
+		//
+		// TODO: a record appended after the history copy above and before
+		// subscribe registers reaches neither the history nor the live
+		// queue, as in LocalDBLedger.Stream.
+		sub := l.subscribe(filter)
+		if sub == nil {
+			return
 		}
-		l.mu.Lock()
-		sub.id = l.nextSubID
-		l.nextSubID++
-		l.subscribers[sub.id] = sub
-		l.mu.Unlock()
+		defer l.unsubscribe(sub)
 
-		defer func() {
-			l.mu.Lock()
-			delete(l.subscribers, sub.id)
-			l.mu.Unlock()
-		}()
-
-		for {
-			select {
-			case rec := <-sub.ch:
-				select {
-				case out <- rec:
-				case <-ctx.Done():
-					return
-				case <-l.stopChan:
-					return
-				}
-			case <-ctx.Done():
-				return
-			case <-l.stopChan:
-				return
-			}
-		}
+		forward(ctx, sub, out)
 	}()
 
 	return out, nil
+}
+
+// subscribe registers a subscriber for live updates, or returns nil once
+// Close has closed stopChan: Close ends only the subscribers it finds, so one
+// registered after it would never end.
+func (l *MemoryLedger) subscribe(topics map[lad.Topic]struct{}) *subscriber {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	select {
+	case <-l.stopChan:
+		return nil
+	default:
+	}
+
+	sub := newSubscriber(l.nextSubID, topics)
+	l.nextSubID++
+	l.subscribers[sub.id] = sub
+	return sub
+}
+
+// unsubscribe ends a subscriber and removes it; the Stream goroutine that
+// registered it defers this. The broadcast goroutine Append or BatchAppend
+// starts may hold the subscriber from a copy taken before the removal, and end
+// makes that send a no-op.
+func (l *MemoryLedger) unsubscribe(sub *subscriber) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	sub.end()
+	delete(l.subscribers, sub.id)
 }
 
 // Snapshot returns a JSON representation of the ledger for debugging and persistence.

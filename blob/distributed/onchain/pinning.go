@@ -231,9 +231,9 @@ func (a PinAcceptance) Verify() error {
 // The interface covers THREE conceptual subsystems that all hit the
 // same contract family:
 //
-//   1. Pinning deployment      — CreatePin, PostBond.
-//   2. Proof-of-storage escalation — OpenChallenge, ExpireChallenge.
-//   3. Replicator bond reclaim — WithdrawBond.
+//  1. Pinning deployment      — CreatePin, PostBond.
+//  2. Proof-of-storage escalation — OpenChallenge, ExpireChallenge.
+//  3. Replicator bond reclaim — WithdrawBond.
 //
 // All three live on one interface because the mesh runtime injects a
 // single EscrowClient at startup and routes every on-chain mutation

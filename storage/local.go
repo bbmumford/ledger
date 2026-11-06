@@ -451,7 +451,16 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 			}
 		}
 
-		// Register for live updates
+		// Register for live updates. Close ends the subscription, and
+		// forward hands over what its queue holds before out closes.
+		//
+		// TODO: a record appended after the history query has read its rows
+		// and before subscribe registers reaches neither the history nor the
+		// live queue, so this consumer never sees it. Subscribing before the
+		// query closes the gap only with a rule for the records both paths
+		// then deliver, and the consumer outside this repository that applies
+		// the stream to a directory cache is not shown to apply a repeated
+		// record harmlessly.
 		subID := l.subscribe(topicSet)
 		defer l.unsubscribe(subID)
 
@@ -460,23 +469,7 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 			return
 		}
 
-		for {
-			select {
-			case rec, ok := <-sub.ch:
-				if !ok {
-					return
-				}
-				select {
-				case out <- rec:
-				case <-ctx.Done():
-					return
-				}
-			case <-ctx.Done():
-				return
-			case <-l.stopChan:
-				return
-			}
-		}
+		forward(ctx, sub, out)
 	}()
 
 	return out, nil
@@ -536,6 +529,18 @@ func (l *LocalDBLedger) Close() error {
 	l.stopOnce.Do(func() {
 		close(l.stopChan)
 
+		// End every subscription before the Bloom filters are saved, which
+		// can take up to 10 s: each Stream goroutine then hands its consumer
+		// what its queue holds and closes its channel, and no Append from here
+		// on queues anything for it. The map is dropped, and subscribe
+		// registers nothing once stopChan is closed.
+		l.mu.Lock()
+		for _, sub := range l.subscribers {
+			sub.end()
+		}
+		l.subscribers = nil
+		l.mu.Unlock()
+
 		// Stop compaction ticker if running
 		if l.compactTicker != nil {
 			l.compactTicker.Stop()
@@ -550,43 +555,43 @@ func (l *LocalDBLedger) Close() error {
 			l.saveBloomFilters(ctx)
 			cancel()
 		}
-
-		l.mu.Lock()
-		defer l.mu.Unlock()
-
-		for _, sub := range l.subscribers {
-			close(sub.ch)
-		}
-		l.subscribers = nil
 	})
 
 	return nil
 }
 
-// subscribe registers a new subscriber for live updates.
+// subscribe registers a new subscriber for live updates and returns its id,
+// or -1 once Close has closed stopChan. Close ends only the subscribers it
+// finds and drops the map, so a Stream goroutine whose history query finishes
+// after Close registers nothing, and getSubscriber(-1) finds no subscriber.
 func (l *LocalDBLedger) subscribe(topics map[lad.Topic]struct{}) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	select {
+	case <-l.stopChan:
+		return -1
+	default:
+	}
+
 	id := l.nextSubID
 	l.nextSubID++
 
-	l.subscribers[id] = &subscriber{
-		id:     id,
-		topics: topics,
-		ch:     make(chan lad.Record, 64),
-	}
+	l.subscribers[id] = newSubscriber(id, topics)
 
 	return id
 }
 
-// unsubscribe removes a subscriber.
+// unsubscribe ends a subscriber and removes it; the Stream goroutine that
+// registered it defers this. The subscriber's channel stays open: broadcast
+// may hold the subscriber from a copy taken before the removal, and end makes
+// that send a no-op.
 func (l *LocalDBLedger) unsubscribe(id int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if sub, ok := l.subscribers[id]; ok {
-		close(sub.ch)
+		sub.end()
 		delete(l.subscribers, id)
 	}
 }
@@ -598,7 +603,8 @@ func (l *LocalDBLedger) getSubscriber(id int) *subscriber {
 	return l.subscribers[id]
 }
 
-// broadcast sends a record to all matching subscribers.
+// broadcast offers a record to every matching subscriber, over a copy of the
+// subscriber set taken under l.mu so that no send holds the lock.
 func (l *LocalDBLedger) broadcast(rec lad.Record) {
 	l.mu.RLock()
 	subs := make([]*subscriber, 0, len(l.subscribers))
