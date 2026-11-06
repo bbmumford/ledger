@@ -19,8 +19,8 @@ import (
 //
 // Fixtures chosen so they are trivially reproducible against Solidity:
 //
-//   piece = "plutus-storage-escrow-test-piece"  (32 ASCII bytes)
-//   nonce = 0x00..1F                             (32 incrementing bytes)
+//	piece = "plutus-storage-escrow-test-piece"  (32 ASCII bytes)
+//	nonce = 0x00..1F                             (32 incrementing bytes)
 //
 // If a future change rewires the hash primitive, this test + the contract
 // must be updated in lockstep: the on-chain expectedHash derivation MUST

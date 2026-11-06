@@ -8,10 +8,10 @@ package ledger
 // Use it as a default when no real metrics backend is configured.
 type NoopMetricsRecorder struct{}
 
-func (NoopMetricsRecorder) RecordApplied(topic string, merged bool)        {}
-func (NoopMetricsRecorder) RecordExpired(topic string)                     {}
-func (NoopMetricsRecorder) MergeConflict(topic string, winner string)      {}
-func (NoopMetricsRecorder) TopicSize(topic string, count int, bytes int64) {}
+func (NoopMetricsRecorder) RecordApplied(topic string, merged bool)         {}
+func (NoopMetricsRecorder) RecordExpired(topic string)                      {}
+func (NoopMetricsRecorder) MergeConflict(topic string, winner string)       {}
+func (NoopMetricsRecorder) TopicSize(topic string, count int, bytes int64)  {}
 func (NoopMetricsRecorder) GossipExchange(topic string, sent, received int) {}
 
 // Verify interface compliance at compile time.
