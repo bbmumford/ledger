@@ -98,7 +98,7 @@ func (l *MemoryLedger) Close() error {
 		close(l.stopChan)
 		l.mu.Lock()
 		for _, sub := range l.subscribers {
-			sub.end()
+			sub.endFor(lad.ErrLedgerClosed)
 		}
 		l.mu.Unlock()
 		if l.gcTicker != nil {
@@ -322,15 +322,24 @@ func (l *MemoryLedger) BatchAppend(ctx context.Context, records []lad.Record) er
 }
 
 // Stream forwards historical and live records to the caller.
-// The returned channel is closed when the context is cancelled or the ledger is closed.
+// The returned channel is closed when the context is cancelled or the ledger
+// is closed. It is StreamWithEnd without the reason the stream ended.
 func (l *MemoryLedger) Stream(ctx context.Context, from lad.CausalWatermark, topics []lad.Topic) (<-chan lad.Record, error) {
-	// Check if ledger is closed
-	select {
-	case <-l.stopChan:
-		return nil, fmt.Errorf("lad: ledger closed")
-	default:
-	}
+	out, _, err := l.StreamWithEnd(ctx, from, topics)
+	return out, err
+}
 
+// StreamWithEnd forwards the records past from on the given topics (all
+// topics when none is given): first the history the ledger holds, then live
+// ones as Append and BatchAppend store them. The returned StreamEnd holds
+// why the channel closed: ctx's error, lad.ErrLedgerClosed or
+// lad.ErrStreamOverflow. A closed ledger refuses with lad.ErrLedgerClosed.
+//
+// The subscription registers and the history is copied under one hold of
+// l.mu, the lock Append and BatchAppend store and take their subscriber copy
+// under, so each record reaches the stream exactly once: in the copy if it
+// was stored before, through the live queue if after.
+func (l *MemoryLedger) StreamWithEnd(ctx context.Context, from lad.CausalWatermark, topics []lad.Topic) (<-chan lad.Record, *lad.StreamEnd, error) {
 	topicSet := make(map[lad.Topic]struct{}, len(topics))
 	for _, topic := range topics {
 		if topic != "" {
@@ -341,55 +350,64 @@ func (l *MemoryLedger) Stream(ctx context.Context, from lad.CausalWatermark, top
 	for k, v := range topicSet {
 		filter[k] = v
 	}
+
+	sub, history := l.subscribeWithHistory(filter, from)
+	if sub == nil {
+		return nil, nil, lad.ErrLedgerClosed
+	}
+
 	out := make(chan lad.Record, 64)
+	end := &lad.StreamEnd{}
 
 	go func() {
 		defer close(out)
-
-		// Emit historical records first.
-		l.mu.RLock()
-		history := make([]lad.Record, 0)
-		for topic, records := range l.logs {
-			if len(filter) > 0 {
-				if _, ok := filter[topic]; !ok {
-					continue
-				}
-			}
-			start := from[topic]
-			for _, rec := range records {
-				if rec.Seq <= start {
-					continue
-				}
-				history = append(history, rec)
-			}
-		}
-		l.mu.RUnlock()
+		// Close ends the subscription, and forward hands over what its
+		// queue holds before out closes.
+		defer l.unsubscribe(sub)
 
 		for _, rec := range history {
 			select {
 			case out <- rec:
 			case <-ctx.Done():
+				end.Set(ctx.Err())
 				return
 			}
 		}
 
-		// Register subscriber for live updates. Close ends the
-		// subscription, and forward hands over what its queue holds before
-		// out closes.
-		//
-		// TODO: a record appended after the history copy above and before
-		// subscribe registers reaches neither the history nor the live
-		// queue, as in LocalDBLedger.Stream.
-		sub := l.subscribe(filter)
-		if sub == nil {
-			return
-		}
-		defer l.unsubscribe(sub)
-
-		forward(ctx, sub, out)
+		end.Set(forward(ctx, sub, out))
 	}()
 
-	return out, nil
+	return out, end, nil
+}
+
+// subscribeWithHistory registers a subscriber for filter (all topics when
+// empty) and copies the records past from on those topics, both under l.mu,
+// so no record stored meanwhile misses both. It returns a nil subscriber once
+// Close has closed stopChan.
+func (l *MemoryLedger) subscribeWithHistory(filter map[lad.Topic]struct{}, from lad.CausalWatermark) (*subscriber, []lad.Record) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	sub := l.subscribeLocked(filter)
+	if sub == nil {
+		return nil, nil
+	}
+	history := make([]lad.Record, 0)
+	for topic, records := range l.logs {
+		if len(filter) > 0 {
+			if _, ok := filter[topic]; !ok {
+				continue
+			}
+		}
+		start := from[topic]
+		for _, rec := range records {
+			if rec.Seq <= start {
+				continue
+			}
+			history = append(history, rec)
+		}
+	}
+	return sub, history
 }
 
 // subscribe registers a subscriber for live updates, or returns nil once
@@ -398,7 +416,11 @@ func (l *MemoryLedger) Stream(ctx context.Context, from lad.CausalWatermark, top
 func (l *MemoryLedger) subscribe(topics map[lad.Topic]struct{}) *subscriber {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.subscribeLocked(topics)
+}
 
+// subscribeLocked is subscribe for a caller that holds l.mu.
+func (l *MemoryLedger) subscribeLocked(topics map[lad.Topic]struct{}) *subscriber {
 	select {
 	case <-l.stopChan:
 		return nil

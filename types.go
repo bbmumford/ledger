@@ -312,6 +312,10 @@ type Ledger interface {
 	Head(ctx context.Context) (CausalWatermark, error)
 	Append(ctx context.Context, rec Record) error
 	BatchAppend(ctx context.Context, records []Record) error
+	// Stream delivers the records past from, history first, then live ones,
+	// until ctx ends or the ledger ends the stream. A record appended while
+	// the stream starts can arrive twice. A ledger that also implements
+	// EndReportingLedger reports why the channel closed.
 	Stream(ctx context.Context, from CausalWatermark, topics []Topic) (<-chan Record, error)
 	Snapshot(ctx context.Context) (io.ReadCloser, error)
 }

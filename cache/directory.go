@@ -220,6 +220,29 @@ type DirectoryCache struct {
 	//
 	// Map shape: identityViews[nodeID][topic] → IdentityView.
 	identityViews map[string]map[string]lad.IdentityView
+
+	// liveAt holds, per tombstoneKey of a member, role or reach record with a
+	// sequence number, the newest such record applyCore let past the
+	// tombstone check. applyTombstone reads it so a tombstone no newer than a
+	// live record loses whichever arrives first, the rule the record check
+	// applies the other way round; applyCore reads it to make an exact repeat
+	// of that record a no-op. A record arrives twice when a ledger stream
+	// overlaps its history read and live queue, and again when a consumer
+	// restarts a stream from an earlier watermark. Written and read under
+	// inMemMu; an entry goes when its tombstone wins or when the sweep finds
+	// no live cache entry under its key.
+	liveAt map[string]liveMark
+}
+
+// liveMark is one liveAt entry: the key's parts, so the sweep can look the
+// live entry up, and the newest record's Timestamp, Seq and content hash.
+type liveMark struct {
+	topic     lad.Topic
+	partition string
+	nodeID    string
+	at        time.Time
+	seq       uint64
+	hash      lad.ContentHash
 }
 
 // ReachDeltaApplier reconstructs a full ReachRecord body from the previous
@@ -570,6 +593,7 @@ func NewDirectoryCache(stores ...CacheStore) *DirectoryCache {
 	dc := &DirectoryCache{
 		store:         store,
 		identityViews: make(map[string]map[string]lad.IdentityView),
+		liveAt:        make(map[string]liveMark),
 	}
 
 	// Wire up legacy map fields for backward compatibility when using MemoryCacheStore.
@@ -1071,6 +1095,16 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 		}
 	}
 
+	// --- Drop liveAt marks whose entry is gone ---
+	// Every eviction above, and EvictNode and the other removals between
+	// sweeps, can remove the entry a mark names; with it gone the mark
+	// protects nothing, so the map stays no larger than the live entries.
+	for key, mark := range c.liveAt {
+		if !c.liveEntryLocked(mark) {
+			delete(c.liveAt, key)
+		}
+	}
+
 	// --- Evict ORPHANED role records ---
 	//
 	// The cascade above only fires the moment a member is liveness-evicted, so
@@ -1174,15 +1208,21 @@ func (c *DirectoryCache) Apply(rec lad.Record) error {
 func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	c.updateLamport(rec.LamportClock)
 
-	// Phase 3: Handle tombstone records — delete matching cache entries
+	// Handle tombstone records — delete matching cache entries
 	if rec.Tombstone {
-		c.applyTombstone(rec)
+		applied, removedMember := c.applyTombstone(rec)
+		if !applied {
+			// A repeat, an older tombstone, or one a live record beats:
+			// the cache and its projection keep what they hold.
+			return nil
+		}
 		// Drop the projection entry too — peers reconciling on the
 		// IBLT need to see the tombstone as a key removal, not as
 		// "still present with old content."
 		c.updateIdentityView(rec)
-		// Fire membership change callback for member tombstones (hypercube rebuild)
-		if rec.Topic == lad.TopicMember && c.OnMembershipChange != nil {
+		// The membership callback rebuilds the hypercube, so it fires only
+		// when the tombstone removed a member.
+		if removedMember && c.OnMembershipChange != nil {
 			c.OnMembershipChange()
 		}
 		return nil
@@ -1224,6 +1264,13 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 				return err
 			}
 		}
+	}
+
+	// An exact repeat of the newest record applied under its key, with its
+	// entry still in the cache, changes nothing: it is not stored, indexed
+	// or announced again.
+	if c.isLiveRepeat(rec) {
+		return nil
 	}
 
 	var isNew bool
@@ -1289,8 +1336,11 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 			rebuilt.UpdatedAt = rec.Timestamp
 			rebuilt.Seq = rec.Seq
 			isNew = !exists
-			c.storeReach(rebuilt)
-			c.setLastReachBody(rebuilt.Partition, rebuilt.NodeID, newBody)
+			// The delta base moves only with the stored record: a stale
+			// or repeated record storeReach refuses leaves both.
+			if c.storeReach(rebuilt) {
+				c.setLastReachBody(rebuilt.Partition, rebuilt.NodeID, newBody)
+			}
 			break
 		}
 		// Full snapshot path.
@@ -1300,8 +1350,9 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 		_, exists := c.store.GetReach(peek.Partition, peek.NodeID)
 		c.inMemMu.RUnlock()
 		isNew = !exists
-		c.storeReach(peek)
-		c.setLastReachBody(peek.Partition, peek.NodeID, rec.Body)
+		if c.storeReach(peek) {
+			c.setLastReachBody(peek.Partition, peek.NodeID, rec.Body)
+		}
 	case lad.TopicLatency:
 		lat, err := lad.UnmarshalLatency(rec.Body)
 		if err != nil {
@@ -1318,6 +1369,7 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 	}
 
 	wasMerged = !isNew
+	c.markLive(rec)
 
 	// Conflict logging — when a merge resolved two different records, log it.
 	if c.conflictLog != nil && wasMerged {
@@ -1381,24 +1433,43 @@ func (c *DirectoryCache) applyCore(rec lad.Record, skipACL bool) error {
 }
 
 // applyTombstone processes a tombstone record: removes matching data from cache
-// and stores the tombstone for re-propagation to peers.
-func (c *DirectoryCache) applyTombstone(rec lad.Record) {
+// and stores the tombstone for re-propagation to peers. applied reports
+// whether it did; removedMember whether a member entry was deleted, which is
+// when applyCore fires OnMembershipChange.
+//
+// It applies nothing for a tombstone already held (same DeletedAt and
+// reason), one older than the held tombstone, or one no newer than the live
+// record liveAt holds for its key. The record check in applyCore lets a
+// record with a sequence number and a Timestamp not before DeletedAt past a
+// held tombstone; refusing such a tombstone when that record is already live
+// gives the same result whichever arrives first, so a tombstone arriving
+// again after the record that beat it deletes nothing.
+func (c *DirectoryCache) applyTombstone(rec lad.Record) (applied, removedMember bool) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
 
 	tKey := tombstoneKey(rec.Topic, rec.Partition, rec.NodeID)
 
+	if mark, ok := c.liveAt[tKey]; ok && c.liveEntryLocked(mark) && !mark.at.Before(rec.DeletedAt) {
+		return false, false
+	}
+
 	// Only store if this tombstone is newer than any existing one for the same key
 	if existing, ok := c.store.GetTombstone(tKey); ok {
 		if rec.DeletedAt.Before(existing.DeletedAt) {
-			return
+			return false, false
+		}
+		if rec.DeletedAt.Equal(existing.DeletedAt) && rec.TombstoneReason == existing.TombstoneReason {
+			return false, false
 		}
 	}
 	c.store.PutTombstone(tKey, rec)
+	delete(c.liveAt, tKey)
 
 	// Delete matching record from live cache maps
 	switch rec.Topic {
 	case lad.TopicMember:
+		_, removedMember = c.store.GetMember(rec.Partition, rec.NodeID)
 		c.store.DeleteMember(rec.Partition, rec.NodeID)
 	case lad.TopicRole:
 		c.store.DeleteRole(rec.Partition, rec.NodeID)
@@ -1408,6 +1479,84 @@ func (c *DirectoryCache) applyTombstone(rec lad.Record) {
 		// For latency tombstones, NodeID holds the latency composite key
 		c.store.DeleteLatency(rec.NodeID)
 	}
+	return true, removedMember
+}
+
+// markLive records rec in liveAt when it is a member, role or reach record
+// with a sequence number and is at least as new as the record held there.
+// applyCore calls it for every record that passed the tombstone and ACL
+// checks and reached the store, whether or not the store's own merge kept
+// it, because the tombstone check judged the record, not the merge.
+func (c *DirectoryCache) markLive(rec lad.Record) {
+	if rec.Seq == 0 || !liveTracked(rec.Topic) {
+		return
+	}
+	tKey := tombstoneKey(rec.Topic, rec.Partition, rec.NodeID)
+	c.inMemMu.Lock()
+	defer c.inMemMu.Unlock()
+	if c.liveAt == nil {
+		c.liveAt = make(map[string]liveMark)
+	}
+	if mark, ok := c.liveAt[tKey]; ok {
+		if rec.Timestamp.Before(mark.at) || (rec.Timestamp.Equal(mark.at) && rec.Seq < mark.seq) {
+			return
+		}
+	}
+	c.liveAt[tKey] = liveMark{
+		topic:     rec.Topic,
+		partition: rec.Partition,
+		nodeID:    rec.NodeID,
+		at:        rec.Timestamp,
+		seq:       rec.Seq,
+		hash:      rec.ContentHash(),
+	}
+}
+
+// isLiveRepeat reports whether rec is the record liveAt holds for its key
+// (same Timestamp, Seq and content hash) and that key's entry is still in
+// the cache. An entry an eviction removed is not a repeat: the record
+// re-adds it.
+func (c *DirectoryCache) isLiveRepeat(rec lad.Record) bool {
+	if rec.Seq == 0 || !liveTracked(rec.Topic) {
+		return false
+	}
+	tKey := tombstoneKey(rec.Topic, rec.Partition, rec.NodeID)
+	c.inMemMu.RLock()
+	mark, ok := c.liveAt[tKey]
+	live := ok && c.liveEntryLocked(mark)
+	c.inMemMu.RUnlock()
+	if !live || !mark.at.Equal(rec.Timestamp) || mark.seq != rec.Seq {
+		return false
+	}
+	return mark.hash == rec.ContentHash()
+}
+
+// liveTracked reports whether liveAt tracks records on topic: the topics
+// whose tombstones delete the entry keyed by the record's own partition and
+// node, which liveEntryLocked can look up.
+func liveTracked(topic lad.Topic) bool {
+	switch topic {
+	case lad.TopicMember, lad.TopicRole, lad.TopicReach:
+		return true
+	}
+	return false
+}
+
+// liveEntryLocked reports whether the cache holds an entry under mark's key.
+// The caller holds inMemMu.
+func (c *DirectoryCache) liveEntryLocked(mark liveMark) bool {
+	switch mark.topic {
+	case lad.TopicMember:
+		_, ok := c.store.GetMember(mark.partition, mark.nodeID)
+		return ok
+	case lad.TopicRole:
+		_, ok := c.store.GetRole(mark.partition, mark.nodeID)
+		return ok
+	case lad.TopicReach:
+		_, ok := c.store.GetReach(mark.partition, mark.nodeID)
+		return ok
+	}
+	return false
 }
 
 // NextLamportClock increments and returns the local Lamport clock.
@@ -1477,9 +1626,14 @@ func (c *DirectoryCache) storeMember(member lad.MemberRecord) {
 	c.store.PutMember(member.Partition, member)
 }
 
+// storeRole keeps the newer of role and the held role by Updated, so an
+// older role record, a repeat included, never replaces a newer one.
 func (c *DirectoryCache) storeRole(role lad.RoleRecord) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
+	if existing, ok := c.store.GetRole(role.Partition, role.NodeID); ok && role.Updated.Before(existing.Updated) {
+		return
+	}
 	c.store.PutRole(role.Partition, role)
 }
 
@@ -1528,9 +1682,12 @@ func (c *DirectoryCache) setLastReachBody(partition, nodeID string, body []byte)
 	tm[nodeID] = dup
 }
 
-func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
+// storeReach stores reach unless it has expired or the held record is newer,
+// and reports whether it stored it; applyCore moves the delta base only
+// then.
+func (c *DirectoryCache) storeReach(reach lad.ReachRecord) bool {
 	if !reach.ExpiresAt.IsZero() && reach.ExpiresAt.Before(time.Now()) {
-		return // already expired
+		return false // already expired
 	}
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
@@ -1540,13 +1697,14 @@ func (c *DirectoryCache) storeReach(reach lad.ReachRecord) {
 	// prevents stale gossip from overwriting fresher state.
 	if existing, ok := c.store.GetReach(reach.Partition, reach.NodeID); ok {
 		if reach.Seq < existing.Seq {
-			return
+			return false
 		}
 		if reach.Seq == existing.Seq && reach.UpdatedAt.Before(existing.UpdatedAt) {
-			return
+			return false
 		}
 	}
 	c.store.PutReach(reach.Partition, reach)
+	return true
 }
 
 // Members returns the registered members for a partition.

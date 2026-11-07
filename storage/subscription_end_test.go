@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -141,6 +142,10 @@ func appendUntil(l lad.Ledger, stop <-chan struct{}, wg *sync.WaitGroup) {
 // under the ledger's lock, so the end must leave the queue open and make the
 // send a no-op; under -race a close of the queue shows as a race between the
 // close and the send, and without -race as a send on a closed channel.
+//
+// The appender outpaces the reader, so a stream can also end by overflowing
+// its queue before the cancel reaches it, an end under the same broadcast;
+// either way the stream reports which end it met.
 func TestLocalDBLedger_AStreamEndingWhileAppendsRunNeverMeetsAClosedQueue(t *testing.T) {
 	l := openNullLedger(t)
 
@@ -155,17 +160,33 @@ func TestLocalDBLedger_AStreamEndingWhileAppendsRunNeverMeetsAClosedQueue(t *tes
 
 	for i := 0; i < 200; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
-		out, err := l.Stream(ctx, nil, nil)
+		out, end, err := l.StreamWithEnd(ctx, nil, nil)
 		if err != nil {
 			cancel()
-			t.Fatalf("Stream: %v", err)
+			t.Fatalf("StreamWithEnd: %v", err)
 		}
-		waitFor(t, "the stream's subscription", func() bool { return len(localSubscribers(l)) == 1 })
+		first := make(chan struct{})
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+			n := 0
+			for range out {
+				if n++; n == 1 {
+					close(first)
+				}
+			}
+			if n == 0 {
+				close(first)
+			}
+		}()
+		<-first
 		cancel()
-		for range out {
-		}
+		<-drained
 		if n := len(localSubscribers(l)); n != 0 {
 			t.Fatalf("iteration %d: %d subscribers left after the stream closed, want 0", i, n)
+		}
+		if why := end.Err(); !errors.Is(why, context.Canceled) && !errors.Is(why, lad.ErrStreamOverflow) {
+			t.Fatalf("iteration %d: the stream ended with %v, want the cancel or the overflow", i, why)
 		}
 	}
 }

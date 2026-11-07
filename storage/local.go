@@ -382,8 +382,24 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	return nil
 }
 
-// Stream forwards historical and live records to the caller.
+// Stream forwards historical and live records to the caller. It is
+// StreamWithEnd without the reason the stream ended.
 func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, topics []lad.Topic) (<-chan lad.Record, error) {
+	out, _, err := l.StreamWithEnd(ctx, from, topics)
+	return out, err
+}
+
+// StreamWithEnd forwards the records past from on the given topics (all
+// topics when none is given): first those the history query reads, then
+// live ones as Append and BatchAppend commit them. The returned StreamEnd
+// holds why the channel closed: ctx's error, lad.ErrLedgerClosed,
+// lad.ErrStreamOverflow, or the history query's error.
+//
+// The subscription registers before the history query runs, so a record
+// committed while the query reads reaches the stream by one path or both:
+// the query's rows, the live queue, or each. A record arriving twice is the
+// price of losing none, and the consumer applies a repeat harmlessly.
+func (l *LocalDBLedger) StreamWithEnd(ctx context.Context, from lad.CausalWatermark, topics []lad.Topic) (<-chan lad.Record, *lad.StreamEnd, error) {
 	topicSet := make(map[lad.Topic]struct{}, len(topics))
 	for _, topic := range topics {
 		if topic != "" {
@@ -392,87 +408,106 @@ func (l *LocalDBLedger) Stream(ctx context.Context, from lad.CausalWatermark, to
 	}
 
 	out := make(chan lad.Record, 64)
+	end := &lad.StreamEnd{}
 
 	go func() {
 		defer close(out)
 
-		// Build WHERE clause for topic filter
-		var topicFilter string
-		var args []interface{}
-		if len(topicSet) > 0 {
-			topicFilter = " AND topic IN ("
-			first := true
-			for topic := range topicSet {
-				if !first {
-					topicFilter += ", "
-				}
-				topicFilter += "?"
-				args = append(args, string(topic))
-				first = false
-			}
-			topicFilter += ")"
-		}
-
-		// Query historical records
-		query := fmt.Sprintf(`
-			SELECT topic, seq, partition_id, node_id, body, signature, timestamp
-			FROM lad_records
-			WHERE 1=1 %s
-			ORDER BY timestamp ASC, topic ASC, seq ASC
-		`, topicFilter)
-
-		rows, err := l.db.QueryContext(ctx, query, args...)
-		if err != nil {
+		// Register for live updates first. Close ends the subscription,
+		// and forward hands over what its queue holds before out closes.
+		subID := l.subscribe(topicSet)
+		if subID < 0 {
+			end.Set(lad.ErrLedgerClosed)
 			return
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var rec lad.Record
-			var topicStr, bodyStr, timestampStr string
-
-			if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
-				return
-			}
-
-			rec.Topic = lad.Topic(topicStr)
-			rec.Body = json.RawMessage(bodyStr)
-			rec.Timestamp, _ = time.Parse(time.RFC3339Nano, timestampStr)
-
-			// Skip if before watermark
-			if from != nil && rec.Seq <= from[rec.Topic] {
-				continue
-			}
-
-			select {
-			case out <- rec:
-			case <-ctx.Done():
-				return
-			}
-		}
-
-		// Register for live updates. Close ends the subscription, and
-		// forward hands over what its queue holds before out closes.
-		//
-		// TODO: a record appended after the history query has read its rows
-		// and before subscribe registers reaches neither the history nor the
-		// live queue, so this consumer never sees it. Subscribing before the
-		// query closes the gap only with a rule for the records both paths
-		// then deliver, and the consumer outside this repository that applies
-		// the stream to a directory cache is not shown to apply a repeated
-		// record harmlessly.
-		subID := l.subscribe(topicSet)
 		defer l.unsubscribe(subID)
-
 		sub := l.getSubscriber(subID)
 		if sub == nil {
+			// Close ran between subscribe and here and dropped the map.
+			end.Set(lad.ErrLedgerClosed)
 			return
 		}
 
-		forward(ctx, sub, out)
+		if err := l.streamHistory(ctx, from, topicSet, out); err != nil {
+			end.Set(err)
+			return
+		}
+
+		end.Set(forward(ctx, sub, out))
 	}()
 
-	return out, nil
+	return out, end, nil
+}
+
+// streamHistory sends the stored records past from on topicSet (all topics
+// when it is empty) to out, in timestamp order. It returns ctx's error when
+// the consumer's context ends first, and the query's error, wrapped, when
+// the read fails; StreamWithEnd ends the stream with either.
+func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWatermark, topicSet map[lad.Topic]struct{}, out chan<- lad.Record) error {
+	// Build WHERE clause for topic filter
+	var topicFilter string
+	var args []interface{}
+	if len(topicSet) > 0 {
+		topicFilter = " AND topic IN ("
+		first := true
+		for topic := range topicSet {
+			if !first {
+				topicFilter += ", "
+			}
+			topicFilter += "?"
+			args = append(args, string(topic))
+			first = false
+		}
+		topicFilter += ")"
+	}
+
+	// Query historical records
+	query := fmt.Sprintf(`
+		SELECT topic, seq, partition_id, node_id, body, signature, timestamp
+		FROM lad_records
+		WHERE 1=1 %s
+		ORDER BY timestamp ASC, topic ASC, seq ASC
+	`, topicFilter)
+
+	rows, err := l.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("lad: stream history query: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var rec lad.Record
+		var topicStr, bodyStr, timestampStr string
+
+		if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
+			return fmt.Errorf("lad: stream history scan: %w", err)
+		}
+
+		rec.Topic = lad.Topic(topicStr)
+		rec.Body = json.RawMessage(bodyStr)
+		rec.Timestamp, _ = time.Parse(time.RFC3339Nano, timestampStr)
+
+		// Skip if before watermark
+		if from != nil && rec.Seq <= from[rec.Topic] {
+			continue
+		}
+
+		select {
+		case out <- rec:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("lad: stream history rows: %w", err)
+	}
+	return nil
 }
 
 // Snapshot returns a reader for the entire ledger state.
@@ -536,7 +571,7 @@ func (l *LocalDBLedger) Close() error {
 		// registers nothing once stopChan is closed.
 		l.mu.Lock()
 		for _, sub := range l.subscribers {
-			sub.end()
+			sub.endFor(lad.ErrLedgerClosed)
 		}
 		l.subscribers = nil
 		l.mu.Unlock()
@@ -562,8 +597,9 @@ func (l *LocalDBLedger) Close() error {
 
 // subscribe registers a new subscriber for live updates and returns its id,
 // or -1 once Close has closed stopChan. Close ends only the subscribers it
-// finds and drops the map, so a Stream goroutine whose history query finishes
-// after Close registers nothing, and getSubscriber(-1) finds no subscriber.
+// finds and drops the map, so a Stream goroutine that starts after Close
+// registers nothing (registering into the dropped map would write a nil map)
+// and StreamWithEnd ends its stream with lad.ErrLedgerClosed.
 func (l *LocalDBLedger) subscribe(topics map[lad.Topic]struct{}) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
