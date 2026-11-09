@@ -104,6 +104,40 @@ type Record struct {
 
 ---
 
+## Streams and the directory cache: what a consumer sees
+
+`Ledger.Stream` delivers history first, then live records. `LocalDBLedger` and `MemoryLedger` also implement
+`EndReportingLedger`, whose `StreamWithEnd` returns a `StreamEnd` that says why the channel closed
+(`stream_end.go`). A consumer that keeps a view from the stream reads that reason; one that only ranges over the
+channel sees a close and nothing more.
+
+| Behaviour | What the consumer sees | Held by |
+|---|---|---|
+| A consumer falls behind | When a live record arrives while the stream's live queue (64 records) is full, the stream ends: every record queued before it is handed over, then the channel closes and `StreamEnd.Err()` is `ErrStreamOverflow`. No record is dropped while the stream carries on. The consumer streams again from a watermark no later than the first record it has not applied. | `storage/stream_end_test.go` `TestLocalDBLedger_AFullQueueEndsTheStreamWithOverflow`, `TestMemoryLedger_AFullQueueEndsTheStreamWithOverflow` |
+| The ledger closes | Open streams end with `ErrLedgerClosed` after handing over what their queue holds. A closed `MemoryLedger` refuses `Stream` and `StreamWithEnd` with `ErrLedgerClosed` (text `ledger: closed`); a closed `LocalDBLedger` returns a stream that ends at once with `ErrLedgerClosed`. `MemoryLedger`'s `Append`, `BatchAppend`, `Snapshot` and `RestoreSnapshot` on a closed ledger still return the untyped `lad: ledger closed`. | `TestLedgers_CloseEndsAStreamWithLedgerClosed` |
+| The caller's context ends | The stream ends with the context's error. | `TestLedgers_ACancelEndsTheStreamWithTheContextError` |
+| The history read fails | The stream ends with the query, scan or rows error, wrapped. | `TestLocalDBLedger_AFailedHistoryReadEndsTheStreamWithItsError` |
+| A record is appended while a stream starts | `LocalDBLedger` subscribes before its history query, so the record arrives by the history, the live queue, or both: a record can arrive twice at the start of a stream, never not at all. `MemoryLedger` registers and copies its history under one lock, so each record arrives once. | `TestLocalDBLedger_ARecordCommittedDuringTheHistoryReadReachesTheStream`, `TestMemoryLedger_RecordsAppendedWhileAStreamStartsArriveOnce` |
+| A tombstone meets a live sequenced record | `DirectoryCache` refuses a tombstone whose `DeletedAt` is not after the newest live member, role or reach record with a sequence number for that key, whichever of the two arrives first. A tombstone equal to the one held applies nothing. | `cache/repeat_apply_test.go` `TestALiveRecordBeatsAnOlderTombstoneInEitherOrder`, `TestATombstoneRepeatedAfterTheMemberReregisteredDeletesNothing` |
+| Membership callbacks | `OnMembershipChange` fires only when a member is removed: not for a tombstone of a member the cache does not hold, and not for a refused tombstone. | `TestATombstoneForAnAbsentMemberAnnouncesNoChange`, `TestApplyingAMemberTombstoneTwiceAnnouncesOneChange` |
+| A repeated record | An exact repeat of the newest record for a key whose entry is still held is not applied or announced again; a record whose entry was evicted is applied again. An older role or reach record leaves the newer one in place. | `TestAnExactRepeatOfTheNewestRecordIsNotAnnouncedAgain`, `TestARecordWhoseEntryWasEvictedIsAppliedAgain`, `TestAnOlderRoleRecordLeavesTheNewerRoles`, `TestAnOlderReachRecordLeavesTheNewerDeltaBase` |
+
+A ledger wrapper must forward `StreamWithEnd`, or a consumer handed the wrapper cannot tell an overflow from the
+ledger's close. loom's signing ledger and reach's `CacheApplyHook.Wrap` forward it.
+
+### Open item: restarting a stream exactly where it stopped
+
+A consumer restarting after `ErrStreamOverflow` replays from the watermark it holds, and the repeat rules above make
+the replay harmless. Restarting from the last record it applied is not possible on what the stream delivers today:
+history arrives in timestamp order (`LocalDBLedger`) or topic by topic in append order (`MemoryLedger`), and live
+records in the order concurrent appends broadcast them, so the highest sequence a consumer has seen can sit above a
+record it has not yet received. The per-topic `Seq` a ledger assigns is
+not gap-free either, since an append may give its own larger `Seq`. Restarting exactly needs a delivery position that
+grows in delivery order (for example the store's row order), which is a change to this package's contract that no
+design states yet.
+
+---
+
 ## API Docs
 
 Generated API reference (pkgsite) for each tagged release is published to GitHub Pages:
