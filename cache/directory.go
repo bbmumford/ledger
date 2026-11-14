@@ -130,9 +130,9 @@ type DirectoryCache struct {
 	// map on this struct.
 	gossipLivenessOverrides map[string]bool
 
-	// Legacy map fields — kept for backward compatibility with tests that access
-	// them directly. When using the default MemoryCacheStore, these point to the
-	// store's internal maps. For custom CacheStore implementations these are nil.
+	// Map fields that alias the store's own maps, read directly by this
+	// package's tests (cache_test.go). With the default MemoryCacheStore they
+	// point to the store's internal maps; for any other CacheStore they are nil.
 	members      map[string]map[string]lad.MemberRecord
 	roles        map[string]map[string]lad.RoleRecord
 	reach        map[string]map[string]lad.ReachRecord
@@ -175,17 +175,19 @@ type DirectoryCache struct {
 	// The sweep's verdict is otherwise trapped in this process: emitTombstone
 	// downgrades reason "liveness" to "liveness-local" precisely so it is NOT
 	// gossiped (a node that blips must never be cascade-evicted fleet-wide).
-	// The cost of that safety is that a genuinely dead node is never
-	// COLLECTIVELY forgotten — every peer evicts on its own independent
-	// clock, and any peer whose clock has not fired re-gossips the corpse
-	// straight back. The record ping-pongs forever.
+	// The cost of that safety is that the verdict alone never makes a
+	// genuinely dead node COLLECTIVELY forgotten — every peer evicts on its
+	// own independent clock, and any peer whose clock has not fired gossips
+	// the record straight back.
 	//
 	// This hook exports the verdict without exporting the authority: the
 	// cache says "I observed this node dead", and the transport layer decides
-	// whether that observation is worth attesting to (HSTLES publishes a
-	// swarm observer-tombstone, which only becomes a propagating death once
-	// K distinct anchors independently agree). Safety stays with the quorum;
-	// the cache never gains the power to evict a peer fleet-wide on its own.
+	// whether that observation is worth attesting to (loom's node, which
+	// registers it through SetOnLivenessEvict, publishes a swarm
+	// observer-tombstone while its swarm role is anchor, and that only becomes
+	// a propagating death once K distinct anchor keys agree). Safety stays
+	// with the quorum; the cache never gains the power to evict a peer
+	// fleet-wide on its own.
 	onLivenessEvict func(nodeID string)
 
 	// ACL, indexing, compaction, and conflict logging.
@@ -315,17 +317,6 @@ func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
 	c.metrics = m
 }
 
-// SetLocalNodeID identifies which NodeID is "self" so eviction never
-// removes the local node's own records. Empty string disables the
-// exemption. Intended for set-once use at startup; safe to call at
-// any time but eviction that has already run with a different value
-// can't be undone.
-//
-// Without this guard, a node whose self-announcement has lapsed past
-// GossipLivenessTimeout can evict its OWN member/role entries and emit
-// a tombstone that propagates, suppressing later re-announcements and
-// turning the node invisible to the rest of the mesh (the exact
-// symptom behind 94-tombstones-vs-2-members).
 // SetOnLivenessEvict registers a callback invoked once per node the liveness
 // sweep declares dead. It fires AFTER the local eviction and OUTSIDE inMemMu,
 // so the callback may take its own locks or publish to a transport without
@@ -334,9 +325,10 @@ func (c *DirectoryCache) SetMetrics(m lad.MetricsRecorder) {
 // The callback receives an OBSERVATION, not an instruction: "this node has
 // been silent past the liveness timeout, as seen from here". It must not treat
 // that as authority to evict the node anywhere else — a single node's view is
-// exactly what the local-only tombstone design refuses to trust. HSTLES turns
-// it into a swarm observer attestation, which becomes a real propagating death
-// only once K distinct anchors independently agree.
+// exactly what the local-only tombstone design refuses to trust. Its one
+// registrant, loom's node (InitSwarm), turns it into a swarm observer
+// attestation while that node's swarm role is anchor, which becomes a
+// propagating death only once K distinct anchor keys agree.
 //
 // Pass nil to clear.
 func (c *DirectoryCache) SetOnLivenessEvict(fn func(nodeID string)) {
@@ -345,6 +337,16 @@ func (c *DirectoryCache) SetOnLivenessEvict(fn func(nodeID string)) {
 	c.onLivenessEvict = fn
 }
 
+// SetLocalNodeID identifies which NodeID is "self" so eviction never
+// removes the local node's own records. Empty string disables the
+// exemption. Intended for set-once use at startup; safe to call at
+// any time but eviction that has already run with a different value
+// can't be undone. loom's node sets it to its own NodeID at startup.
+//
+// Without this guard, a node whose self-announcement has lapsed past
+// GossipLivenessTimeout can evict its OWN member/role entries and emit
+// a tombstone that propagates, suppressing later re-announcements and
+// turning the node invisible to the rest of the mesh.
 func (c *DirectoryCache) SetLocalNodeID(nodeID string) {
 	c.inMemMu.Lock()
 	defer c.inMemMu.Unlock()
@@ -596,7 +598,7 @@ func NewDirectoryCache(stores ...CacheStore) *DirectoryCache {
 		liveAt:        make(map[string]liveMark),
 	}
 
-	// Wire up legacy map fields for backward compatibility when using MemoryCacheStore.
+	// Alias the map fields the package's tests read to a MemoryCacheStore's maps.
 	if ms, ok := store.(*MemoryCacheStore); ok {
 		dc.members = ms.Members
 		dc.roles = ms.Roles
@@ -852,7 +854,7 @@ func (c *DirectoryCache) EvictExpired() int {
 	removed, livenessEvicted, notify := c.evictExpiredLocked()
 
 	// Fire the liveness verdicts outside inMemMu. The callback publishes to a
-	// transport (HSTLES turns each into a swarm observer attestation), and
+	// transport (loom's node turns each into a swarm observer attestation), and
 	// holding the cache lock across a transport call invites deadlock — the
 	// transport's own delivery path can re-enter this cache.
 	for _, nodeID := range livenessEvicted {
@@ -882,12 +884,11 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	// Self-exemption: a node must never evict its OWN member record.
 	// Doing so creates a self-referential "liveness" tombstone that
 	// propagates via gossip and suppresses the node's own future
-	// re-announcements (tombstone wins on causal compare). Before this
-	// guard, any node that went 16 minutes without re-publishing
+	// re-announcements (tombstone wins on causal compare): without this
+	// guard, any node that goes 16 minutes without re-publishing
 	// (e.g. quiet service hours) would self-tombstone and vanish from
 	// its peers' member directories even while its peer connections
-	// stayed healthy — the mechanism behind the 94-tombstones-vs-2-
-	// members symptom on help.orbtr.io after fleet-wide deploys.
+	// stay healthy.
 	allMembers := c.store.AllMembers()
 	for partition, members := range allMembers {
 		for _, rec := range members {
@@ -1108,12 +1109,9 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 	// --- Evict ORPHANED role records ---
 	//
 	// The cascade above only fires the moment a member is liveness-evicted, so
-	// it cannot reach a role whose member is ALREADY gone. Every node that died
-	// before roles had any expiry path left exactly that: a role with no member,
-	// which no code path could ever remove. Live fleet: 127 roles against 8
-	// members and ~11 real machines, and mesh-topology builds machines[] from
-	// the role table — so each orphan renders as a healthy grade-A peer that
-	// peers keep dialling (noise-UDP to msg2 timeout, WS 401/404 -> TLS).
+	// it cannot reach a role whose member is ALREADY gone: a role with no
+	// member, which no other code path removes, so it would stay in every
+	// view built from the role records as a node that is still serving.
 	//
 	// A role is a projection the reach bridge pairs onto an inbound swarm
 	// fleet.peer record. No member means the source is gone and the projection
@@ -1160,9 +1158,8 @@ func (c *DirectoryCache) evictExpiredLocked() (int, []string, func(string)) {
 		}
 		// Roles are reported alongside the swept topics because a role count
 		// far above the member count is the signature of orphaned projections
-		// — the condition this sweep exists to prevent, and one that was
-		// invisible while roles went uncounted (live fleet: 127 roles against
-		// 8 members and ~11 real machines).
+		// — the condition this sweep exists to prevent, and one a log that
+		// left roles uncounted would not show.
 		totalRoles := 0
 		for _, roles := range c.store.AllRoles() {
 			totalRoles += len(roles)
@@ -2161,8 +2158,8 @@ func (c *DirectoryCache) DumpSince(since time.Time) []lad.Record {
 	return records
 }
 
-// ChangesSince returns the number of records with Timestamp after the given time.
-// Used by adaptive gossip interval (Phase E1) to measure cache change rate.
+// ChangesSince returns the number of records with Timestamp after the given time,
+// a measure of the cache's change rate. No code in the estate calls it.
 func (c *DirectoryCache) ChangesSince(since time.Time) int {
 	c.inMemMu.RLock()
 	defer c.inMemMu.RUnlock()
