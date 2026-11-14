@@ -56,16 +56,16 @@ func DefaultLedgerConfig() LedgerConfig {
 	}
 }
 
-// RequirePartitionColumn refuses a lad_records table that keeps each record's
-// partition in a tenant_id column. Every statement in this ledger and in loom's
-// mesh ledger reads and writes partition_id, and CREATE TABLE IF NOT EXISTS
+// RequirePartitionColumn refuses a ladRecords table that keeps each record's
+// partition in a tenantId column. Every statement in this ledger and in loom's
+// mesh ledger reads and writes partitionId, and CREATE TABLE IF NOT EXISTS
 // leaves an existing table as it is, so such a table would fail on the
-// partition_id index. The table is not rewritten: the error tells the operator
+// partitionId index. The table is not rewritten: the error tells the operator
 // to delete the ledger database so it is created again. A missing table passes.
 func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(lad_records)`)
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(ladRecords)`)
 	if err != nil {
-		return fmt.Errorf("lad: read lad_records columns: %w", err)
+		return fmt.Errorf("lad: read ladRecords columns: %w", err)
 	}
 	defer rows.Close()
 
@@ -79,21 +79,21 @@ func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
 			pk         int
 		)
 		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
-			return fmt.Errorf("lad: read lad_records columns: %w", err)
+			return fmt.Errorf("lad: read ladRecords columns: %w", err)
 		}
 		switch name {
-		case "tenant_id":
+		case "tenantId":
 			hasTenantColumn = true
-		case "partition_id":
+		case "partitionId":
 			hasPartitionColumn = true
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("lad: read lad_records columns: %w", err)
+		return fmt.Errorf("lad: read ladRecords columns: %w", err)
 	}
 	if hasTenantColumn && !hasPartitionColumn {
-		return fmt.Errorf("lad: lad_records keeps the partition in a tenant_id column, " +
-			"but this ledger reads partition_id; delete the ledger database so it is created again")
+		return fmt.Errorf("lad: ladRecords keeps the partition in a tenantId column, " +
+			"but this ledger reads partitionId; delete the ledger database so it is created again")
 	}
 	return nil
 }
@@ -103,11 +103,11 @@ func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
 //
 // The schema is automatically initialized:
 //
-//	CREATE TABLE IF NOT EXISTS lad_records (
+//	CREATE TABLE IF NOT EXISTS ladRecords (
 //	    topic TEXT NOT NULL,
 //	    seq INTEGER NOT NULL,
-//	    partition_id TEXT NOT NULL,
-//	    node_id TEXT NOT NULL,
+//	    partitionId TEXT NOT NULL,
+//	    nodeId TEXT NOT NULL,
 //	    body TEXT NOT NULL,
 //	    signature BLOB,
 //	    timestamp TEXT NOT NULL,
@@ -123,25 +123,25 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 
 	// Initialize schema
 	schema := `
-		CREATE TABLE IF NOT EXISTS lad_records (
+		CREATE TABLE IF NOT EXISTS ladRecords (
 			topic TEXT NOT NULL,
 			seq INTEGER NOT NULL,
-			partition_id TEXT NOT NULL,
-			node_id TEXT NOT NULL,
+			partitionId TEXT NOT NULL,
+			nodeId TEXT NOT NULL,
 			body TEXT NOT NULL,
 			signature BLOB,
 			timestamp TEXT NOT NULL,
 			PRIMARY KEY (topic, seq)
 		);
-		CREATE INDEX IF NOT EXISTS idx_lad_partition ON lad_records(partition_id, topic, seq);
-		CREATE INDEX IF NOT EXISTS idx_lad_node ON lad_records(node_id, topic, seq);
-		CREATE INDEX IF NOT EXISTS idx_lad_timestamp ON lad_records(timestamp DESC);
+		CREATE INDEX IF NOT EXISTS idxLadPartition ON ladRecords(partitionId, topic, seq);
+		CREATE INDEX IF NOT EXISTS idxLadNode ON ladRecords(nodeId, topic, seq);
+		CREATE INDEX IF NOT EXISTS idxLadTimestamp ON ladRecords(timestamp DESC);
 		
 		-- Bloom filter table for efficient existence checks
-		CREATE TABLE IF NOT EXISTS lad_bloom_filters (
+		CREATE TABLE IF NOT EXISTS ladBloomFilters (
 			scope TEXT NOT NULL,
-			filter_data BLOB NOT NULL,
-			updated_at TEXT NOT NULL,
+			filterData BLOB NOT NULL,
+			updatedAt TEXT NOT NULL,
 			PRIMARY KEY (scope)
 		);
 	`
@@ -187,7 +187,7 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 func (l *LocalDBLedger) Head(ctx context.Context) (lad.CausalWatermark, error) {
 	query := `
 		SELECT topic, MAX(seq) as max_seq
-		FROM lad_records
+		FROM ladRecords
 		GROUP BY topic
 	`
 
@@ -236,7 +236,7 @@ func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
 
 	// Insert record into database
 	query := `
-		INSERT INTO lad_records (topic, seq, partition_id, node_id, body, signature, timestamp)
+		INSERT INTO ladRecords (topic, seq, partitionId, nodeId, body, signature, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`
 
@@ -306,7 +306,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 
 	// Prepare insert statement
 	stmt, err := tx.PrepareContext(txCtx, `
-		INSERT INTO lad_records (topic, seq, partition_id, node_id, body, signature, timestamp)
+		INSERT INTO ladRecords (topic, seq, partitionId, nodeId, body, signature, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -463,8 +463,8 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 
 	// Query historical records
 	query := fmt.Sprintf(`
-		SELECT topic, seq, partition_id, node_id, body, signature, timestamp
-		FROM lad_records
+		SELECT topic, seq, partitionId, nodeId, body, signature, timestamp
+		FROM ladRecords
 		WHERE 1=1 %s
 		ORDER BY timestamp ASC, topic ASC, seq ASC
 	`, topicFilter)
@@ -514,8 +514,8 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 // This enables rapid bootstrap of new nodes from existing ledger data.
 func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 	query := `
-		SELECT topic, seq, partition_id, node_id, body, signature, timestamp
-		FROM lad_records
+		SELECT topic, seq, partitionId, nodeId, body, signature, timestamp
+		FROM ladRecords
 		ORDER BY timestamp ASC, topic ASC, seq ASC
 	`
 
@@ -686,9 +686,9 @@ func (l *LocalDBLedger) Compact(ctx context.Context) error {
 
 	for {
 		result, err := l.db.ExecContext(ctx,
-			`DELETE FROM lad_records 
+			`DELETE FROM ladRecords 
 			 WHERE rowid IN (
-				SELECT rowid FROM lad_records 
+				SELECT rowid FROM ladRecords 
 				WHERE timestamp < ? 
 				LIMIT ?
 			)`,
@@ -742,7 +742,7 @@ func (l *LocalDBLedger) GetCompactStats(ctx context.Context) (CompactStats, erro
 	}
 
 	// Count total records
-	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM lad_records`).Scan(&stats.TotalRecords)
+	err := l.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM ladRecords`).Scan(&stats.TotalRecords)
 	if err != nil {
 		return stats, fmt.Errorf("lad: failed to count records: %w", err)
 	}
@@ -750,7 +750,7 @@ func (l *LocalDBLedger) GetCompactStats(ctx context.Context) (CompactStats, erro
 	// Get oldest record timestamp
 	var oldestStr sql.NullString
 	err = l.db.QueryRowContext(ctx,
-		`SELECT timestamp FROM lad_records ORDER BY timestamp ASC LIMIT 1`,
+		`SELECT timestamp FROM ladRecords ORDER BY timestamp ASC LIMIT 1`,
 	).Scan(&oldestStr)
 	if err != nil && err != sql.ErrNoRows {
 		return stats, fmt.Errorf("lad: failed to get oldest record: %w", err)
@@ -762,7 +762,7 @@ func (l *LocalDBLedger) GetCompactStats(ctx context.Context) (CompactStats, erro
 	// Get newest record timestamp
 	var newestStr sql.NullString
 	err = l.db.QueryRowContext(ctx,
-		`SELECT timestamp FROM lad_records ORDER BY timestamp DESC LIMIT 1`,
+		`SELECT timestamp FROM ladRecords ORDER BY timestamp DESC LIMIT 1`,
 	).Scan(&newestStr)
 	if err != nil && err != sql.ErrNoRows {
 		return stats, fmt.Errorf("lad: failed to get newest record: %w", err)
@@ -806,7 +806,7 @@ func (l *LocalDBLedger) loadBloomFilters() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	rows, err := l.db.QueryContext(ctx, `SELECT scope, filter_data FROM lad_bloom_filters`)
+	rows, err := l.db.QueryContext(ctx, `SELECT scope, filterData FROM ladBloomFilters`)
 	if err != nil {
 		return fmt.Errorf("lad: query bloom filters: %w", err)
 	}
@@ -849,13 +849,13 @@ func (l *LocalDBLedger) saveBloomFilters(ctx context.Context) error {
 	defer tx.Rollback()
 
 	// Clear existing filters
-	if _, err := tx.ExecContext(ctx, `DELETE FROM lad_bloom_filters`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM ladBloomFilters`); err != nil {
 		return fmt.Errorf("lad: clear bloom filters: %w", err)
 	}
 
 	// Save current filters
 	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO lad_bloom_filters (scope, filter_data, updated_at)
+		INSERT INTO ladBloomFilters (scope, filterData, updatedAt)
 		VALUES (?, ?, ?)
 	`)
 	if err != nil {
@@ -902,7 +902,7 @@ func (l *LocalDBLedger) rebuildBloomFilters(ctx context.Context) error {
 
 	// Query all records and rebuild filters
 	rows, err := l.db.QueryContext(ctx, `
-		SELECT topic, seq, partition_id, node_id FROM lad_records
+		SELECT topic, seq, partitionId, nodeId FROM ladRecords
 	`)
 	if err != nil {
 		return fmt.Errorf("lad: query for bloom rebuild: %w", err)
