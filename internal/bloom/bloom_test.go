@@ -6,6 +6,7 @@ package bloom
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"sync"
 	"testing"
 )
@@ -353,4 +354,108 @@ func BenchmarkBloomFilterContains(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		bf.Contains(testData)
 	}
+}
+
+// A caller-supplied BloomConfig reaches NewBloomFilter unchecked through
+// BloomFilterManager.GetOrCreate, which LocalDBLedger.updateBloomFilter calls
+// on every Append. Each input here sized the filter to zero bits or fed
+// math.Log a value outside (0,1); the filter must still take an Add and
+// answer Contains for what it holds.
+func TestNewBloomFilterTakesAnAddForUnusableSizingInputs(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		expected uint64
+		rate     float64
+	}{
+		{"zero expected elements", 0, 0.01},
+		{"zero false-positive rate", 100, 0},
+		{"negative false-positive rate", 100, -0.5},
+		{"false-positive rate of one", 100, 1},
+		{"false-positive rate above one", 100, 2},
+		{"zero elements and zero rate", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("NewBloomFilter(%d, %v) then Add panicked: %v", tc.expected, tc.rate, r)
+				}
+			}()
+			bf := NewBloomFilter(tc.expected, tc.rate)
+			if bf.numBits == 0 || bf.numHash == 0 || uint64(bf.numHash) > bf.numBits {
+				t.Fatalf("NewBloomFilter(%d, %v) sized %d bits and %d hash rounds; Add needs at least one bit "+
+					"and no more rounds than bits", tc.expected, tc.rate, bf.numBits, bf.numHash)
+			}
+			bf.Add([]byte("held"))
+			if !bf.Contains([]byte("held")) {
+				t.Fatalf("NewBloomFilter(%d, %v): an added element is reported absent", tc.expected, tc.rate)
+			}
+		})
+	}
+
+	t.Run("manager with a zero-element config", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("GetOrCreate under BloomConfig{ExpectedElements: 0} then Add panicked: %v", r)
+			}
+		}()
+		mgr := NewBloomFilterManager(BloomConfig{ExpectedElements: 0, FalsePositiveRate: 0.01})
+		mgr.GetOrCreate("scope").Add([]byte("record"))
+	})
+}
+
+// LocalDBLedger.loadBloomFilters hands every stored row to
+// DeserializeBloomFilter and skips a row it refuses, so the scope gets a fresh
+// filter from GetOrCreate. A row whose bit count is zero or larger than its bit
+// slice would make the next Add divide by zero or index past the slice, and a
+// row whose hash count exceeds its bit count would make every Add and Contains
+// run that many hash rounds under the filter's lock, so each is refused; a row
+// whose hash count is zero would report every element present, so the count
+// is lifted to one.
+func TestDeserializeBloomFilterRefusesACorruptStoredRow(t *testing.T) {
+	row := func(numBits uint64, numHash uint32, bits []byte) []byte {
+		data := make([]byte, 12+len(bits))
+		binary.LittleEndian.PutUint64(data[0:8], numBits)
+		binary.LittleEndian.PutUint32(data[8:12], numHash)
+		copy(data[12:], bits)
+		return data
+	}
+
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"zero bit count", row(0, 3, make([]byte, 8))},
+		{"bit count past the slice", row(65, 3, make([]byte, 8))},
+		{"bit count with no slice", row(8, 3, nil)},
+		{"hash count past the bit count", row(64, 65, make([]byte, 8))},
+		{"hash count of billions", row(64, 1<<32-1, make([]byte, 8))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bf, err := DeserializeBloomFilter(tc.data)
+			if err == nil {
+				t.Fatalf("DeserializeBloomFilter accepted a corrupt row (filter %+v); the next Add would panic", bf)
+			}
+		})
+	}
+
+	t.Run("bit count at the slice edge is accepted", func(t *testing.T) {
+		bf, err := DeserializeBloomFilter(row(64, 3, make([]byte, 8)))
+		if err != nil {
+			t.Fatalf("a row whose bit count fills its slice exactly was refused: %v", err)
+		}
+		bf.Add([]byte("edge"))
+		if !bf.Contains([]byte("edge")) {
+			t.Fatal("an element added to an edge-sized row is reported absent")
+		}
+	})
+
+	t.Run("zero hash count is lifted to one", func(t *testing.T) {
+		bf, err := DeserializeBloomFilter(row(64, 0, make([]byte, 8)))
+		if err != nil {
+			t.Fatalf("a row with a zero hash count was refused: %v", err)
+		}
+		if bf.Contains([]byte("never added")) {
+			t.Fatal("an empty filter read from a row with a zero hash count reports an element present")
+		}
+	})
 }

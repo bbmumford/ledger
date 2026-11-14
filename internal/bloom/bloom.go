@@ -25,9 +25,24 @@ type BloomFilter struct {
 // NewBloomFilter creates a Bloom filter optimized for the expected number of elements
 // and desired false positive rate.
 func NewBloomFilter(expectedElements uint64, falsePositiveRate float64) *BloomFilter {
+	// Clamp inputs. BloomFilterManager.GetOrCreate passes a caller-supplied
+	// BloomConfig here on LocalDBLedger.updateBloomFilter's first record for a
+	// scope, so DefaultBloomConfig is not the only input. expectedElements==0
+	// divides the hash count below by zero, which leaves every Add running
+	// billions of hash rounds; a false-positive rate outside (0,1) makes the
+	// bit count from math.Log zero, negative or infinite.
+	if expectedElements == 0 {
+		expectedElements = 1
+	}
+	if falsePositiveRate <= 0 || falsePositiveRate >= 1 {
+		falsePositiveRate = 0.01
+	}
 	// Calculate optimal number of bits
 	// m = -(n * ln(p)) / (ln(2)^2)
 	numBits := uint64(math.Ceil(-float64(expectedElements) * math.Log(falsePositiveRate) / (math.Log(2) * math.Log(2))))
+	if numBits == 0 {
+		numBits = 1
+	}
 
 	// Calculate optimal number of hash functions
 	// k = (m/n) * ln(2)
@@ -110,6 +125,26 @@ func DeserializeBloomFilter(data []byte) (*BloomFilter, error) {
 	numHash := binary.LittleEndian.Uint32(data[8:12])
 	bits := make([]byte, len(data)-12)
 	copy(bits, data[12:])
+
+	// Validate numBits against the actual bit-slice length. A corrupt
+	// row with numBits==0 makes Add panic on `hash % 0`; numBits > len(bits)*8
+	// makes Add index bits[idx/8] out of range. Either crashes the ledger on the
+	// next updateBloomFilter→Add; the len(data) < 12 check above catches
+	// neither.
+	if numBits == 0 || numBits > uint64(len(bits))*8 {
+		return nil, fmt.Errorf("bloom: invalid numBits=%d for %d-byte bit slice", numBits, len(bits))
+	}
+	// A hash count of 0 makes Contains report every element present, so it is
+	// lifted to 1. A hash count above the bit count is refused: NewBloomFilter
+	// never writes one (k = ceil(m/n * ln 2) is at most m), and Add and Contains
+	// each run one hash round per count, so a corrupt row of billions would
+	// hold the filter's lock on every call.
+	if numHash == 0 {
+		numHash = 1
+	}
+	if uint64(numHash) > numBits {
+		return nil, fmt.Errorf("bloom: invalid numHash=%d for numBits=%d", numHash, numBits)
+	}
 
 	return &BloomFilter{
 		bits:    bits,
