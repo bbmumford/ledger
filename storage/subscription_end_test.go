@@ -428,7 +428,7 @@ func TestLedgers_AStreamWhoseCallerCancelsWithNothingQueuedEnds(t *testing.T) {
 	})
 	t.Run("MemoryLedger", func(t *testing.T) {
 		l := NewMemoryLedger(MemoryLedgerConfig{})
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		check(t, func(ctx context.Context) (<-chan lad.Record, error) { return l.Stream(ctx, nil, nil) },
 			func() []*subscriber { return memorySubscribers(l) })
 	})

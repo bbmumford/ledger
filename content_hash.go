@@ -8,6 +8,7 @@ package ledger
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"hash"
 	"sort"
 )
 
@@ -64,7 +65,7 @@ func (r Record) ContentHash() ContentHash {
 
 // writeLenPrefixed writes a length-prefixed byte slice for hash
 // canonicalisation. 4-byte big-endian length, then the bytes.
-func writeLenPrefixed(h interface{ Write([]byte) (int, error) }, b []byte) {
+func writeLenPrefixed(h hash.Hash, b []byte) {
 	var ln [4]byte
 	binary.BigEndian.PutUint32(ln[:], uint32(len(b)))
 	h.Write(ln[:])

@@ -170,7 +170,9 @@ func TestDirectoryCacheMembersFiltering(t *testing.T) {
 				PubKey:    []byte("key"),
 			}
 			body, _ := json.Marshal(member)
-			cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
+			if err := cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body}); err != nil {
+				t.Fatalf("Apply failed: %v", err)
+			}
 		}
 	}
 
@@ -215,7 +217,9 @@ func TestDirectoryCacheRolesFiltering(t *testing.T) {
 	}
 	for _, role := range roles {
 		body, _ := json.Marshal(role)
-		cache.Apply(lad.Record{Topic: lad.TopicRole, Body: body})
+		if err := cache.Apply(lad.Record{Topic: lad.TopicRole, Body: body}); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
 	}
 
 	ctx := context.Background()
@@ -251,7 +255,9 @@ func TestDirectoryCacheReachFiltering(t *testing.T) {
 	}
 	for _, reach := range reaches {
 		body, _ := json.Marshal(reach)
-		cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
+		if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body}); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
 	}
 
 	ctx := context.Background()
@@ -339,7 +345,9 @@ func TestDirectoryCacheConcurrency(t *testing.T) {
 				NodeID:    string(rune('A' + id%26)),
 			}
 			body, _ := json.Marshal(member)
-			cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
+			if err := cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body}); err != nil {
+				t.Errorf("Apply failed: %v", err)
+			}
 		}(i)
 	}
 
@@ -349,9 +357,15 @@ func TestDirectoryCacheConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cache.Members(ctx, "tenant-1")
-			cache.Roles(ctx, "tenant-1", RoleQuery{})
-			cache.Reach(ctx, "tenant-1", ReachQuery{})
+			if _, err := cache.Members(ctx, "tenant-1"); err != nil {
+				t.Errorf("Members failed: %v", err)
+			}
+			if _, err := cache.Roles(ctx, "tenant-1", RoleQuery{}); err != nil {
+				t.Errorf("Roles failed: %v", err)
+			}
+			if _, err := cache.Reach(ctx, "tenant-1", ReachQuery{}); err != nil {
+				t.Errorf("Reach failed: %v", err)
+			}
 		}()
 	}
 
@@ -386,7 +400,9 @@ func TestDirectoryCacheExpiredReach(t *testing.T) {
 		ExpiresAt:    time.Now().Add(-1 * time.Hour), // Already expired
 	}
 	body, _ := json.Marshal(reach)
-	cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
+	if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body}); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
 
 	ctx := context.Background()
 	result, err := cache.Reach(ctx, "tenant-1", ReachQuery{})
@@ -410,7 +426,9 @@ func TestDirectoryCacheReachRegionPreference(t *testing.T) {
 	}
 	for _, reach := range reaches {
 		body, _ := json.Marshal(reach)
-		cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
+		if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body}); err != nil {
+			t.Fatalf("Apply failed: %v", err)
+		}
 	}
 
 	ctx := context.Background()
@@ -502,7 +520,9 @@ func TestStoreReachRejectsExpired(t *testing.T) {
 		ExpiresAt: time.Now().Add(-5 * time.Minute),
 	}
 	body, _ := json.Marshal(reach)
-	cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
+	if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body}); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
 
 	cache.inMemMu.RLock()
 	count := len(cache.reach["tenant-1"])
@@ -524,7 +544,9 @@ func TestStoreReachKeepsNewerSeq(t *testing.T) {
 		ExpiresAt: expiry,
 	}
 	body, _ := json.Marshal(r1)
-	cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body, Seq: 10, Timestamp: time.Now()})
+	if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body, Seq: 10, Timestamp: time.Now()}); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
 
 	// Apply older record with seq=5 — should be rejected
 	r2 := lad.ReachRecord{
@@ -534,7 +556,9 @@ func TestStoreReachKeepsNewerSeq(t *testing.T) {
 		ExpiresAt: expiry,
 	}
 	body, _ = json.Marshal(r2)
-	cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body, Seq: 5, Timestamp: time.Now()})
+	if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body, Seq: 5, Timestamp: time.Now()}); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
 
 	ctx := context.Background()
 	result, _ := cache.Reach(ctx, "tenant-1", ReachQuery{NodeID: "node-1"})
@@ -621,7 +645,9 @@ func BenchmarkDirectoryCacheApply(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cache.Apply(rec)
+		if err := cache.Apply(rec); err != nil {
+			b.Fatalf("Apply failed: %v", err)
+		}
 	}
 }
 
@@ -635,13 +661,17 @@ func BenchmarkDirectoryCacheMembers(b *testing.B) {
 			NodeID:    string(rune(i)),
 		}
 		body, _ := json.Marshal(member)
-		cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body})
+		if err := cache.Apply(lad.Record{Topic: lad.TopicMember, Body: body}); err != nil {
+			b.Fatalf("Apply failed: %v", err)
+		}
 	}
 
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cache.Members(ctx, "tenant-1")
+		if _, err := cache.Members(ctx, "tenant-1"); err != nil {
+			b.Fatalf("Members failed: %v", err)
+		}
 	}
 }
 
@@ -660,12 +690,16 @@ func BenchmarkDirectoryCacheReach(b *testing.B) {
 			ExpiresAt:    expireTime,
 		}
 		body, _ := json.Marshal(reach)
-		cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body})
+		if err := cache.Apply(lad.Record{Topic: lad.TopicReach, Body: body}); err != nil {
+			b.Fatalf("Apply failed: %v", err)
+		}
 	}
 
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cache.Reach(ctx, "tenant-1", ReachQuery{MinHealth: 0.5, MaxLoad: 0.8, Limit: 10})
+		if _, err := cache.Reach(ctx, "tenant-1", ReachQuery{MinHealth: 0.5, MaxLoad: 0.8, Limit: 10}); err != nil {
+			b.Fatalf("Reach failed: %v", err)
+		}
 	}
 }

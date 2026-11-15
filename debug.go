@@ -60,4 +60,4 @@ func (d *DebugLogger) Printf(format string, args ...interface{}) {
 	}
 }
 
-var dbgLADTypes = NewDebug("ledger.types")
+var dbgLADTypes = NewDebug("ledger.types") //nolint:unused // the ledger.types DEBUG subsystem's logger, declared for record-type diagnostics

@@ -67,7 +67,7 @@ func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("lad: read ladRecords columns: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var hasTenantColumn, hasPartitionColumn bool
 	for rows.Next() {
@@ -161,11 +161,10 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 	if cfg.EnableBloomFilters {
 		ledger.bloomMgr = bloom.NewBloomFilterManager(cfg.BloomConfig)
 
-		// Load existing Bloom filters from database
-		if err := ledger.loadBloomFilters(); err != nil {
-			// Log error but don't fail initialization
-			// Bloom filters will be rebuilt on first rebuild cycle
-		}
+		// Load existing Bloom filters from database. A failed load does not
+		// fail initialization: the rebuild cycle, when configured, rebuilds
+		// the filters from the stored records.
+		_ = ledger.loadBloomFilters()
 
 		// Start periodic rebuild if configured
 		if cfg.BloomConfig.RebuildInterval > 0 {
@@ -195,7 +194,7 @@ func (l *LocalDBLedger) Head(ctx context.Context) (lad.CausalWatermark, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lad: query head: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	wm := make(lad.CausalWatermark)
 	for rows.Next() {
@@ -290,7 +289,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	if err != nil {
 		return fmt.Errorf("lad: begin transaction: %w", err)
 	}
-	defer tx.Rollback() // Rollback on error
+	defer func() { _ = tx.Rollback() }() // Rollback on error
 
 	// Get current head for each topic to assign sequences
 	head, err := l.Head(ctx)
@@ -312,7 +311,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	if err != nil {
 		return fmt.Errorf("lad: prepare batch insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	// Process each record
 	processedRecords := make([]lad.Record, 0, len(records))
@@ -476,7 +475,7 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 		}
 		return fmt.Errorf("lad: stream history query: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var rec lad.Record
@@ -527,8 +526,8 @@ func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		defer rows.Close()
-		defer pw.Close()
+		defer func() { _ = rows.Close() }()
+		defer func() { _ = pw.Close() }()
 
 		encoder := json.NewEncoder(pw)
 
@@ -585,9 +584,10 @@ func (l *LocalDBLedger) Close() error {
 		if l.bloomTicker != nil {
 			l.bloomTicker.Stop()
 
-			// Save Bloom filters one last time
+			// Save Bloom filters one last time. Close does not fail on it: a
+			// failed save rolls back and leaves the filters stored before.
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			l.saveBloomFilters(ctx)
+			_ = l.saveBloomFilters(ctx)
 			cancel()
 		}
 	})
@@ -810,7 +810,7 @@ func (l *LocalDBLedger) loadBloomFilters() error {
 	if err != nil {
 		return fmt.Errorf("lad: query bloom filters: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	loaded := 0
 	for rows.Next() {
@@ -846,7 +846,7 @@ func (l *LocalDBLedger) saveBloomFilters(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("lad: begin bloom save: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Clear existing filters
 	if _, err := tx.ExecContext(ctx, `DELETE FROM ladBloomFilters`); err != nil {
@@ -861,7 +861,7 @@ func (l *LocalDBLedger) saveBloomFilters(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("lad: prepare bloom insert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	now := time.Now().UTC().Format(time.RFC3339)
 	for scope, filter := range l.bloomMgr.Filters() {
@@ -907,7 +907,7 @@ func (l *LocalDBLedger) rebuildBloomFilters(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("lad: query for bloom rebuild: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	count := 0
 	for rows.Next() {

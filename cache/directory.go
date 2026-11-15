@@ -83,7 +83,7 @@ type CacheStatsReport struct {
 // reintroducing the original c.mu contention.
 type DirectoryCache struct {
 	inMemMu   sync.RWMutex
-	persistMu sync.Mutex
+	persistMu sync.Mutex //nolint:unused // the persistence lock the lock split above defines for a CacheStore that does I/O; MemoryCacheStore takes none
 	store     CacheStore
 
 	// dumpSigningKey signs records rebuilt from typed projections in
@@ -372,6 +372,11 @@ func (c *DirectoryCache) Subscribe(topic lad.Topic, handler func(lad.Record)) {
 }
 
 // mergeFunc returns the merge function for a topic, defaulting to OverwriteMerge.
+// It is the read side of RegisterMerge and RegisterTopic's Merge.
+// TODO: no apply path consults it, so a registered merge function is stored
+// and not applied.
+//
+//nolint:unused // the read side of the merge registration; see the TODO above
 func (c *DirectoryCache) mergeFunc(topic lad.Topic) lad.MergeFunc {
 	if c.mergeFuncs != nil {
 		if fn, ok := c.mergeFuncs[topic]; ok {
