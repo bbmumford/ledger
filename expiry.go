@@ -51,7 +51,9 @@ func (w *ExpiryWorker) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			w.cache.PruneExpired()
+			// A failed sweep leaves the records for the next tick; callers
+			// that need the error call PruneExpired directly.
+			_, _ = w.cache.PruneExpired()
 		}
 	}
 }

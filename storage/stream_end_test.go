@@ -48,7 +48,7 @@ func TestLocalDBLedger_AFullQueueEndsTheStreamWithOverflow(t *testing.T) {
 // TestMemoryLedger_ClosingTheLedgerHandsOverWhatTheQueueHolds does.
 func TestMemoryLedger_AFullQueueEndsTheStreamWithOverflow(t *testing.T) {
 	l := NewMemoryLedger(MemoryLedgerConfig{})
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 	out, end, err := l.StreamWithEnd(context.Background(), nil, nil)
 	if err != nil {
 		t.Fatalf("StreamWithEnd: %v", err)
@@ -131,7 +131,7 @@ func TestLedgers_ACancelEndsTheStreamWithTheContextError(t *testing.T) {
 	})
 	t.Run("MemoryLedger", func(t *testing.T) {
 		l := NewMemoryLedger(MemoryLedgerConfig{})
-		defer l.Close()
+		defer func() { _ = l.Close() }()
 		check(t, func(ctx context.Context) (<-chan lad.Record, *lad.StreamEnd, error) {
 			return l.StreamWithEnd(ctx, nil, nil)
 		})
