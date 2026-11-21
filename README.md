@@ -125,6 +125,16 @@ channel sees a close and nothing more.
 A ledger wrapper must forward `StreamWithEnd`, or a consumer handed the wrapper cannot tell an overflow from the
 ledger's close. loom's signing ledger and reach's `CacheApplyHook.Wrap` forward it.
 
+### Signing a record the ledger numbers
+
+`Seq` is part of the signed bytes (`signatures.go`). A record the ledger numbers (one appended with `Seq` 0) is
+signed through `SigningLedger`: `AppendSigned` and `BatchAppendSigned` give the record its `Seq` and `Timestamp` and
+then call the caller's sign function, in the one step that stores it, so the signature covers the `Seq` stored.
+`LocalDBLedger` and `MemoryLedger` implement it, and loom's signing ledger signs through it. `Append` and
+`BatchAppend` refuse a signed record with no `Seq` (`ErrSignedWithoutSeq`). `LocalDBLedger` numbers each append
+inside the transaction that stores it, and stores every field of a record, so a record replayed through `Stream` or
+`Snapshot` verifies and a tombstone replays as a tombstone.
+
 ### Open item: restarting a stream exactly where it stopped
 
 A consumer restarting after `ErrStreamOverflow` replays from the watermark it holds, and the repeat rules above make

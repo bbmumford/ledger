@@ -22,7 +22,13 @@ import (
 // This is used for LAD peer discovery records - ephemeral data that survives restarts
 // but is NOT distributed via Raft. Synchronization happens via LAD gossip protocol.
 type LocalDBLedger struct {
-	db          *sql.DB
+	db *sql.DB
+	// appendMu makes one append's head read, signature and insert finish
+	// before the next append reads the head. SQLite takes a transaction's
+	// write lock only at its first write, so two appends that each read a
+	// topic's head inside their own transaction could both read it before
+	// either inserts, and the second would be refused by the primary key.
+	appendMu    sync.Mutex
 	mu          sync.RWMutex
 	subscribers map[int]*subscriber
 	nextSubID   int
@@ -357,32 +363,64 @@ func (l *LocalDBLedger) Head(ctx context.Context) (lad.CausalWatermark, error) {
 	return wm, nil
 }
 
-// Append validates and stores a record with Raft-replicated persistence.
+// Append validates and stores a record in the local database. A record with no
+// Seq is given the topic's next one and a zero Timestamp is set to now, inside
+// the transaction that stores it. A signed record with no Seq is refused with
+// lad.ErrSignedWithoutSeq: AppendSigned numbers before it signs.
 func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
+	return l.append(ctx, rec, nil)
+}
+
+// AppendSigned is Append with sign called on the record after it is numbered
+// and before it is stored, in the same transaction (lad.SigningLedger).
+func (l *LocalDBLedger) AppendSigned(ctx context.Context, rec lad.Record, sign lad.SignFunc) error {
+	if sign == nil {
+		return fmt.Errorf("lad: AppendSigned needs a sign function")
+	}
+	return l.append(ctx, rec, sign)
+}
+
+func (l *LocalDBLedger) append(ctx context.Context, rec lad.Record, sign lad.SignFunc) error {
 	if rec.Topic == "" {
 		return fmt.Errorf("lad: missing topic")
 	}
+	if sign == nil && rec.Seq == 0 && len(rec.Signature) > 0 {
+		return lad.ErrSignedWithoutSeq
+	}
 
-	// Auto-assign sequence if not set
+	l.appendMu.Lock()
+	defer l.appendMu.Unlock()
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("lad: begin append: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	if rec.Seq == 0 {
-		head, err := l.Head(ctx)
+		head, err := topicHead(ctx, tx, rec.Topic)
 		if err != nil {
 			return fmt.Errorf("lad: get head for seq: %w", err)
 		}
-		rec.Seq = head[rec.Topic] + 1
+		rec.Seq = head + 1
 	}
-
-	// Auto-set timestamp if not provided
 	if rec.Timestamp.IsZero() {
 		rec.Timestamp = time.Now().UTC()
+	}
+	if sign != nil {
+		if err := sign(&rec); err != nil {
+			return fmt.Errorf("lad: sign record: %w", err)
+		}
 	}
 
 	args, err := recordArgs(rec)
 	if err != nil {
 		return err
 	}
-	if _, err := l.db.ExecContext(ctx, insertRecord, args...); err != nil {
+	if _, err := tx.ExecContext(ctx, insertRecord, args...); err != nil {
 		return fmt.Errorf("lad: insert record: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("lad: commit record: %w", err)
 	}
 
 	// Update Bloom filter if enabled
@@ -396,10 +434,39 @@ func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
 	return nil
 }
 
+// topicHead reads topic's highest stored Seq through q, 0 for an empty topic.
+func topicHead(ctx context.Context, q interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, topic lad.Topic) (uint64, error) {
+	var head sql.NullInt64
+	if err := q.QueryRowContext(ctx, `SELECT MAX(seq) FROM ladRecords WHERE topic = ?`, string(topic)).Scan(&head); err != nil {
+		return 0, err
+	}
+	if !head.Valid {
+		return 0, nil
+	}
+	return uint64(head.Int64), nil
+}
+
 // BatchAppend appends multiple records in a single transaction for high-throughput scenarios.
-// Records are assigned sequences atomically and subscribers are notified after commit.
-// Maximum batch size is 1000 records to avoid large transactions.
+// Records are assigned sequences inside that transaction and subscribers are notified after commit.
+// Maximum batch size is 1000 records to avoid large transactions. A signed record with no Seq
+// refuses the whole batch with lad.ErrSignedWithoutSeq.
 func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) error {
+	return l.batchAppend(ctx, records, nil)
+}
+
+// BatchAppendSigned is BatchAppend with sign called on each record after it is
+// numbered and before it is stored, in the batch's transaction
+// (lad.SigningLedger).
+func (l *LocalDBLedger) BatchAppendSigned(ctx context.Context, records []lad.Record, sign lad.SignFunc) error {
+	if sign == nil {
+		return fmt.Errorf("lad: BatchAppendSigned needs a sign function")
+	}
+	return l.batchAppend(ctx, records, sign)
+}
+
+func (l *LocalDBLedger) batchAppend(ctx context.Context, records []lad.Record, sign lad.SignFunc) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -408,27 +475,40 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	if len(records) > maxBatchSize {
 		return fmt.Errorf("lad: batch size %d exceeds maximum %d", len(records), maxBatchSize)
 	}
+	for i := range records {
+		if records[i].Topic == "" {
+			return fmt.Errorf("lad: missing topic in record %d", i)
+		}
+		if sign == nil && records[i].Seq == 0 && len(records[i].Signature) > 0 {
+			return fmt.Errorf("lad: record %d: %w", i, lad.ErrSignedWithoutSeq)
+		}
+	}
 
 	// Create a transaction with 5-second timeout
 	txCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
+	l.appendMu.Lock()
+	defer l.appendMu.Unlock()
 	tx, err := l.db.BeginTx(txCtx, nil)
 	if err != nil {
 		return fmt.Errorf("lad: begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }() // Rollback on error
 
-	// Get current head for each topic to assign sequences
-	head, err := l.Head(ctx)
-	if err != nil {
-		return fmt.Errorf("lad: get head for batch: %w", err)
-	}
-
-	// Track next sequence per topic within this batch
+	// Next sequence per topic within this batch, each topic's head read
+	// through the batch's own transaction when the batch first meets it.
 	nextSeq := make(map[lad.Topic]uint64)
-	for topic, seq := range head {
-		nextSeq[topic] = seq + 1
+	next := func(topic lad.Topic) (uint64, error) {
+		if seq, ok := nextSeq[topic]; ok {
+			return seq, nil
+		}
+		head, err := topicHead(txCtx, tx, topic)
+		if err != nil {
+			return 0, fmt.Errorf("lad: get head for batch: %w", err)
+		}
+		nextSeq[topic] = head + 1
+		return head + 1, nil
 	}
 
 	// Prepare insert statement
@@ -443,24 +523,26 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	for i := range records {
 		rec := &records[i]
 
-		if rec.Topic == "" {
-			return fmt.Errorf("lad: missing topic in record %d", i)
+		seq, err := next(rec.Topic)
+		if err != nil {
+			return err
 		}
-
-		// Auto-assign sequence if not set
 		if rec.Seq == 0 {
-			rec.Seq = nextSeq[rec.Topic]
-			nextSeq[rec.Topic]++
-		} else {
-			// If sequence is manually set, update our tracking
-			if rec.Seq >= nextSeq[rec.Topic] {
-				nextSeq[rec.Topic] = rec.Seq + 1
-			}
+			rec.Seq = seq
+			nextSeq[rec.Topic] = seq + 1
+		} else if rec.Seq >= seq {
+			// A Seq the caller set moves the batch's numbering past it.
+			nextSeq[rec.Topic] = rec.Seq + 1
 		}
 
 		// Auto-set timestamp if not provided
 		if rec.Timestamp.IsZero() {
 			rec.Timestamp = time.Now().UTC()
+		}
+		if sign != nil {
+			if err := sign(rec); err != nil {
+				return fmt.Errorf("lad: sign record %d: %w", i, err)
+			}
 		}
 
 		args, err := recordArgs(*rec)

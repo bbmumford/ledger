@@ -203,8 +203,23 @@ func (l *MemoryLedger) Head(ctx context.Context) (lad.CausalWatermark, error) {
 	return wm, nil
 }
 
-// Append validates and stores a record.
+// Append validates and stores a record. A record with no Seq is given the
+// topic's next one under the lock that stores it. A signed record with no Seq
+// is refused with lad.ErrSignedWithoutSeq: AppendSigned numbers before it signs.
 func (l *MemoryLedger) Append(ctx context.Context, rec lad.Record) error {
+	return l.append(ctx, rec, nil)
+}
+
+// AppendSigned is Append with sign called on the record after it is numbered
+// and before it is stored, under the same lock (lad.SigningLedger).
+func (l *MemoryLedger) AppendSigned(ctx context.Context, rec lad.Record, sign lad.SignFunc) error {
+	if sign == nil {
+		return fmt.Errorf("lad: AppendSigned needs a sign function")
+	}
+	return l.append(ctx, rec, sign)
+}
+
+func (l *MemoryLedger) append(ctx context.Context, rec lad.Record, sign lad.SignFunc) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -214,6 +229,9 @@ func (l *MemoryLedger) Append(ctx context.Context, rec lad.Record) error {
 	}
 	if rec.Topic == "" {
 		return fmt.Errorf("lad: missing topic")
+	}
+	if sign == nil && rec.Seq == 0 && len(rec.Signature) > 0 {
+		return lad.ErrSignedWithoutSeq
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -225,6 +243,11 @@ func (l *MemoryLedger) Append(ctx context.Context, rec lad.Record) error {
 	}
 	if rec.Timestamp.IsZero() {
 		rec.Timestamp = time.Now().UTC()
+	}
+	if sign != nil {
+		if err := sign(&rec); err != nil {
+			return fmt.Errorf("lad: sign record: %w", err)
+		}
 	}
 	l.seq[rec.Topic] = rec.Seq
 	l.logs[rec.Topic] = append(l.logs[rec.Topic], rec)
@@ -247,8 +270,22 @@ func (l *MemoryLedger) Append(ctx context.Context, rec lad.Record) error {
 	return nil
 }
 
-// BatchAppend appends multiple records atomically.
+// BatchAppend appends multiple records atomically. A signed record with no
+// Seq refuses the whole batch with lad.ErrSignedWithoutSeq.
 func (l *MemoryLedger) BatchAppend(ctx context.Context, records []lad.Record) error {
+	return l.batchAppend(ctx, records, nil)
+}
+
+// BatchAppendSigned is BatchAppend with sign called on each record after it is
+// numbered and before any is stored (lad.SigningLedger).
+func (l *MemoryLedger) BatchAppendSigned(ctx context.Context, records []lad.Record, sign lad.SignFunc) error {
+	if sign == nil {
+		return fmt.Errorf("lad: BatchAppendSigned needs a sign function")
+	}
+	return l.batchAppend(ctx, records, sign)
+}
+
+func (l *MemoryLedger) batchAppend(ctx context.Context, records []lad.Record, sign lad.SignFunc) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -264,15 +301,23 @@ func (l *MemoryLedger) BatchAppend(ctx context.Context, records []lad.Record) er
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Validate and assign sequences
+	// Validate, number and sign every record against a copy of the topic
+	// heads, so a batch refused at any record changes no head.
+	seqs := make(map[lad.Topic]uint64, len(l.seq))
+	for topic, seq := range l.seq {
+		seqs[topic] = seq
+	}
 	for i := range records {
 		rec := &records[i]
 
 		if rec.Topic == "" {
 			return fmt.Errorf("lad: missing topic in record %d", i)
 		}
+		if sign == nil && rec.Seq == 0 && len(rec.Signature) > 0 {
+			return fmt.Errorf("lad: record %d: %w", i, lad.ErrSignedWithoutSeq)
+		}
 
-		seq := l.seq[rec.Topic]
+		seq := seqs[rec.Topic]
 		if rec.Seq == 0 {
 			rec.Seq = seq + 1
 		} else if rec.Seq <= seq {
@@ -283,10 +328,15 @@ func (l *MemoryLedger) BatchAppend(ctx context.Context, records []lad.Record) er
 		if rec.Timestamp.IsZero() {
 			rec.Timestamp = time.Now().UTC()
 		}
+		if sign != nil {
+			if err := sign(rec); err != nil {
+				return fmt.Errorf("lad: sign record %d: %w", i, err)
+			}
+		}
 
-		// Update sequence tracking
-		l.seq[rec.Topic] = rec.Seq
+		seqs[rec.Topic] = rec.Seq
 	}
+	l.seq = seqs
 
 	// Append all records
 	for _, rec := range records {
