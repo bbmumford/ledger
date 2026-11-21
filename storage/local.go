@@ -98,21 +98,154 @@ func RequirePartitionColumn(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// addedRecordColumns are the ladRecords columns a table holding only topic,
+// seq, partitionId, nodeId, body, signature and timestamp lacks, each with the
+// definition ALTER TABLE adds it by. Each default is the zero value of the field
+// the column holds, so a row stored without the column reads back with that
+// field at its zero value.
+var addedRecordColumns = []struct{ name, definition string }{
+	{"lamportClock", "lamportClock INTEGER NOT NULL DEFAULT 0"},
+	{"hlcTimestamp", "hlcTimestamp INTEGER NOT NULL DEFAULT 0"},
+	{"tombstone", "tombstone INTEGER NOT NULL DEFAULT 0"},
+	{"deletedAtUnix", "deletedAtUnix INTEGER NOT NULL DEFAULT 0"},
+	{"tombstoneReason", "tombstoneReason TEXT NOT NULL DEFAULT ''"},
+	{"expiresAtUnix", "expiresAtUnix INTEGER NOT NULL DEFAULT 0"},
+	{"authorPubkey", "authorPubkey BLOB"},
+	{"blobCid", "blobCid TEXT NOT NULL DEFAULT ''"},
+}
+
+// addRecordColumns adds to ladRecords every column of addedRecordColumns it
+// lacks. NewLocalDBLedger runs it after CREATE TABLE IF NOT EXISTS, which leaves
+// an existing table as it is, so a LAD file whose ladRecords lacks them opens
+// with every column Append, BatchAppend, Stream and Snapshot name. A row stored
+// without them reads back with no author key, no tombstone and zero clocks.
+func addRecordColumns(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(ladRecords)`)
+	if err != nil {
+		return fmt.Errorf("lad: read ladRecords columns: %w", err)
+	}
+	have := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid        int
+			name, kind string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultVal, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("lad: read ladRecords columns: %w", err)
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("lad: read ladRecords columns: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("lad: read ladRecords columns: %w", err)
+	}
+	for _, c := range addedRecordColumns {
+		if have[c.name] {
+			continue
+		}
+		if _, err := db.ExecContext(ctx, `ALTER TABLE ladRecords ADD COLUMN `+c.definition); err != nil {
+			return fmt.Errorf("lad: add ladRecords column %s: %w", c.name, err)
+		}
+	}
+	return nil
+}
+
+// recordColumns names every ladRecords column in the order recordArgs binds
+// them and scanRecord reads them.
+const recordColumns = `topic, seq, partitionId, nodeId, body, signature, timestamp,
+	lamportClock, hlcTimestamp, tombstone, deletedAtUnix, tombstoneReason, expiresAtUnix,
+	authorPubkey, blobCid`
+
+// insertRecord is the INSERT Append and BatchAppend store a record with.
+const insertRecord = `INSERT INTO ladRecords (` + recordColumns + `)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+// recordArgs binds rec's fields to insertRecord's placeholders. The body is
+// stored as the bytes given, never re-encoded, because the signature covers
+// those bytes; a body that is not JSON is refused. A zero DeletedAt or
+// ExpiresAt is stored as 0, as the gossip codec sends it.
+func recordArgs(rec lad.Record) ([]any, error) {
+	if len(rec.Body) > 0 && !json.Valid(rec.Body) {
+		return nil, fmt.Errorf("lad: record body is not JSON")
+	}
+	var tombstone int64
+	if rec.Tombstone {
+		tombstone = 1
+	}
+	return []any{
+		string(rec.Topic),
+		rec.Seq,
+		rec.Partition,
+		rec.NodeID,
+		string(rec.Body),
+		rec.Signature,
+		rec.Timestamp.Format(time.RFC3339Nano),
+		rec.LamportClock,
+		rec.HLCTimestamp,
+		tombstone,
+		unixNanos(rec.DeletedAt),
+		rec.TombstoneReason,
+		unixNanos(rec.ExpiresAt),
+		rec.AuthorPubKey,
+		rec.BlobCID,
+	}, nil
+}
+
+// scanRecord reads one row selected by recordColumns.
+func scanRecord(rows *sql.Rows) (lad.Record, error) {
+	var (
+		rec                    lad.Record
+		topic, body, timestamp string
+		tombstone              int64
+		deletedAt, expiresAt   int64
+	)
+	if err := rows.Scan(&topic, &rec.Seq, &rec.Partition, &rec.NodeID, &body, &rec.Signature, &timestamp,
+		&rec.LamportClock, &rec.HLCTimestamp, &tombstone, &deletedAt, &rec.TombstoneReason, &expiresAt,
+		&rec.AuthorPubKey, &rec.BlobCID); err != nil {
+		return lad.Record{}, err
+	}
+	rec.Topic = lad.Topic(topic)
+	if body != "" {
+		rec.Body = json.RawMessage(body)
+	}
+	rec.Timestamp, _ = time.Parse(time.RFC3339Nano, timestamp)
+	rec.Tombstone = tombstone != 0
+	rec.DeletedAt = fromUnixNanos(deletedAt)
+	rec.ExpiresAt = fromUnixNanos(expiresAt)
+	return rec, nil
+}
+
+// unixNanos is t in Unix nanoseconds, 0 for the zero time.
+func unixNanos(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// fromUnixNanos is unixNanos's inverse: 0 is the zero time.
+func fromUnixNanos(n int64) time.Time {
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n).UTC()
+}
+
 // NewLocalDBLedger creates a persistent ledger backed by a local embedded libSQL database.
 // Pass DefaultLedgerConfig() for sensible defaults, or customize retention and compaction.
 //
-// The schema is automatically initialized:
-//
-//	CREATE TABLE IF NOT EXISTS ladRecords (
-//	    topic TEXT NOT NULL,
-//	    seq INTEGER NOT NULL,
-//	    partitionId TEXT NOT NULL,
-//	    nodeId TEXT NOT NULL,
-//	    body TEXT NOT NULL,
-//	    signature BLOB,
-//	    timestamp TEXT NOT NULL,
-//	    PRIMARY KEY (topic, seq)
-//	);
+// The schema is automatically initialized: ladRecords holds one column for every
+// field of a lad.Record (recordColumns), so a record read back through Stream or
+// Snapshot carries the bytes it was signed over. A ladRecords table that lacks
+// any of those columns gets them added (addRecordColumns), each at its zero value
+// for the rows already stored.
 func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 	if db == nil {
 		return nil, fmt.Errorf("lad: database connection required")
@@ -131,6 +264,14 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 			body TEXT NOT NULL,
 			signature BLOB,
 			timestamp TEXT NOT NULL,
+			lamportClock INTEGER NOT NULL DEFAULT 0,
+			hlcTimestamp INTEGER NOT NULL DEFAULT 0,
+			tombstone INTEGER NOT NULL DEFAULT 0,
+			deletedAtUnix INTEGER NOT NULL DEFAULT 0,
+			tombstoneReason TEXT NOT NULL DEFAULT '',
+			expiresAtUnix INTEGER NOT NULL DEFAULT 0,
+			authorPubkey BLOB,
+			blobCid TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (topic, seq)
 		);
 		CREATE INDEX IF NOT EXISTS idxLadPartition ON ladRecords(partitionId, topic, seq);
@@ -148,6 +289,9 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("lad: failed to initialize schema: %w", err)
+	}
+	if err := addRecordColumns(context.Background(), db); err != nil {
+		return nil, err
 	}
 
 	ledger := &LocalDBLedger{
@@ -233,27 +377,11 @@ func (l *LocalDBLedger) Append(ctx context.Context, rec lad.Record) error {
 		rec.Timestamp = time.Now().UTC()
 	}
 
-	// Insert record into database
-	query := `
-		INSERT INTO ladRecords (topic, seq, partitionId, nodeId, body, signature, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`
-
-	bodyJSON, err := json.Marshal(rec.Body)
+	args, err := recordArgs(rec)
 	if err != nil {
-		return fmt.Errorf("lad: marshal body: %w", err)
+		return err
 	}
-
-	_, err = l.db.ExecContext(ctx, query,
-		string(rec.Topic),
-		rec.Seq,
-		rec.Partition,
-		rec.NodeID,
-		string(bodyJSON),
-		rec.Signature,
-		rec.Timestamp.Format(time.RFC3339Nano),
-	)
-	if err != nil {
+	if _, err := l.db.ExecContext(ctx, insertRecord, args...); err != nil {
 		return fmt.Errorf("lad: insert record: %w", err)
 	}
 
@@ -304,10 +432,7 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 	}
 
 	// Prepare insert statement
-	stmt, err := tx.PrepareContext(txCtx, `
-		INSERT INTO ladRecords (topic, seq, partitionId, nodeId, body, signature, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`)
+	stmt, err := tx.PrepareContext(txCtx, insertRecord)
 	if err != nil {
 		return fmt.Errorf("lad: prepare batch insert: %w", err)
 	}
@@ -338,23 +463,11 @@ func (l *LocalDBLedger) BatchAppend(ctx context.Context, records []lad.Record) e
 			rec.Timestamp = time.Now().UTC()
 		}
 
-		// Marshal body
-		bodyJSON, err := json.Marshal(rec.Body)
+		args, err := recordArgs(*rec)
 		if err != nil {
-			return fmt.Errorf("lad: marshal body for record %d: %w", i, err)
+			return fmt.Errorf("lad: record %d: %w", i, err)
 		}
-
-		// Execute insert
-		_, err = stmt.ExecContext(txCtx,
-			string(rec.Topic),
-			rec.Seq,
-			rec.Partition,
-			rec.NodeID,
-			string(bodyJSON),
-			rec.Signature,
-			rec.Timestamp.Format(time.RFC3339Nano),
-		)
-		if err != nil {
+		if _, err := stmt.ExecContext(txCtx, args...); err != nil {
 			return fmt.Errorf("lad: insert record %d: %w", i, err)
 		}
 
@@ -462,11 +575,11 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 
 	// Query historical records
 	query := fmt.Sprintf(`
-		SELECT topic, seq, partitionId, nodeId, body, signature, timestamp
+		SELECT %s
 		FROM ladRecords
 		WHERE 1=1 %s
 		ORDER BY timestamp ASC, topic ASC, seq ASC
-	`, topicFilter)
+	`, recordColumns, topicFilter)
 
 	rows, err := l.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -478,16 +591,10 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
-		var rec lad.Record
-		var topicStr, bodyStr, timestampStr string
-
-		if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
+		rec, err := scanRecord(rows)
+		if err != nil {
 			return fmt.Errorf("lad: stream history scan: %w", err)
 		}
-
-		rec.Topic = lad.Topic(topicStr)
-		rec.Body = json.RawMessage(bodyStr)
-		rec.Timestamp, _ = time.Parse(time.RFC3339Nano, timestampStr)
 
 		// Skip if before watermark
 		if from != nil && rec.Seq <= from[rec.Topic] {
@@ -512,8 +619,7 @@ func (l *LocalDBLedger) streamHistory(ctx context.Context, from lad.CausalWaterm
 // Snapshot returns a reader for the entire ledger state.
 // This enables rapid bootstrap of new nodes from existing ledger data.
 func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
-	query := `
-		SELECT topic, seq, partitionId, nodeId, body, signature, timestamp
+	query := `SELECT ` + recordColumns + `
 		FROM ladRecords
 		ORDER BY timestamp ASC, topic ASC, seq ASC
 	`
@@ -532,17 +638,11 @@ func (l *LocalDBLedger) Snapshot(ctx context.Context) (io.ReadCloser, error) {
 		encoder := json.NewEncoder(pw)
 
 		for rows.Next() {
-			var rec lad.Record
-			var topicStr, bodyStr, timestampStr string
-
-			if err := rows.Scan(&topicStr, &rec.Seq, &rec.Partition, &rec.NodeID, &bodyStr, &rec.Signature, &timestampStr); err != nil {
+			rec, err := scanRecord(rows)
+			if err != nil {
 				pw.CloseWithError(err)
 				return
 			}
-
-			rec.Topic = lad.Topic(topicStr)
-			rec.Body = json.RawMessage(bodyStr)
-			rec.Timestamp, _ = time.Parse(time.RFC3339Nano, timestampStr)
 
 			if err := encoder.Encode(rec); err != nil {
 				pw.CloseWithError(err)
