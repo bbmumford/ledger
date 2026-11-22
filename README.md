@@ -66,16 +66,21 @@ A transport moves bytes. Ledger gives those bytes meaning — typed records for 
 ```go
 // Record is a single entry in the distributed directory.
 type Record struct {
-    Topic        Topic           // member, role, reach, latency, keyops, quorum
-    NodeID       string          // which peer this record describes
-    Partition    string          // partition scope (empty = global)
-    Body         json.RawMessage // typed payload (MemberRecord, RoleRecord, etc.)
-    Timestamp    time.Time
-    LamportClock uint64          // causal ordering
-    Seq          uint32          // per-node sequence number
-    Tombstone    bool            // soft delete
-    ExpiresAt    time.Time       // TTL
-    Signature    []byte          // Ed25519 signature over canonical encoding
+    Topic           Topic           // member, role, reach, latency, keyops, quorum, ...
+    Seq             uint64          // per-node sequence number
+    Partition       string          // partition scope (empty = global)
+    NodeID          string          // which peer this record describes
+    Body            json.RawMessage // typed payload (MemberRecord, RoleRecord, etc.)
+    Signature       []byte          // Ed25519 signature over the canonical encoding
+    Timestamp       time.Time
+    LamportClock    uint64          // causal ordering
+    HLCTimestamp    uint64          // hybrid logical clock (0 = unused)
+    Tombstone       bool            // deletion marker
+    DeletedAt       time.Time
+    TombstoneReason string          // "explicit", "cap"
+    ExpiresAt       time.Time       // TTL expiration (zero = never)
+    AuthorPubKey    []byte          // Ed25519 public key of the record's author
+    BlobCID         string          // content-addressed blob reference
 }
 ```
 
@@ -95,12 +100,31 @@ type Record struct {
 
 ## Architecture Principles
 
-1. **Append-only**. Every state change appends a new record. Conflicts resolved by Lamport clock + sequence; older records tombstoned, never mutated in place.
+1. **Append-only**. Every state change appends a new record; older records are tombstoned, never mutated in place. Which record a key keeps is decided by the topic's merge function (see Design).
 2. **Signed end-to-end**. Every record carries an Ed25519 signature by its `NodeID`. A peer can verify any record came from the claimed author.
 3. **CRDT-friendly**. Records converge deterministically given the same set of observations — ordering doesn't matter for eventual consistency, Lamport clock breaks ties for causally-dependent updates.
 4. **Transport-agnostic**. Ledger doesn't import any network code. The `whisper_adapter.go` provides `GossipPayload` serialisation; consumers wire Ledger to Whisper (or any other gossip engine) at the integration layer.
 5. **Pluggable persistence**. `CacheStore` is an interface with a memory-backed default; consumers plug in SQLite, Turso, or any KV store that satisfies the contract.
 6. **Partition isolation**. Every record carries a `Partition`. Queries scope to a partition; the empty string is the global scope. A deployment with several partitions never serves one partition's state to another.
+
+---
+
+## Design
+
+Each topic's behaviour is registered on the `DirectoryCache`, whole with `RegisterTopic(topic, TopicConfig)` or one part at a time with `RegisterMerge` and `RegisterKey`:
+
+| `TopicConfig` field | When unset | Meaning |
+|---|---|---|
+| `Merge` | `OverwriteMerge` | which record a key keeps when a record arrives for a key that already holds one (`func(existing, incoming Record) (Record, error)`) |
+| `Key` | `NodeIDKey` | the key a record is stored under; `BodyKey` reads `collection` and `key` from the JSON body |
+| `ExpiryEnabled` | off | honour `ExpiresAt` |
+| `RequireSignature` | off | refuse unsigned records |
+| `VerifyFunc` | Ed25519 | the signature check |
+| `SignFunc` | none | signs this node's own writes |
+
+`OverwriteMerge` keeps the record with the higher `HLCTimestamp` when both records carry one, and otherwise the later `Timestamp`; an exact tie keeps the existing record. It does not order by `LamportClock`, which restarts from zero when a node restarts. The timestamp fallback compares two records of the same node only while the key is `NodeIDKey`; a topic keyed by `BodyKey` holds several nodes' records under one key, so it needs a merge function of its own rather than the default.
+
+A topic can also carry a write ACL (`RegisterACL`), named secondary indexes (`RegisterIndex`, read with `QueryByIndex`) and a compaction policy (`RegisterCompaction`). `QueryFilter` (node, key prefix, since, limit) is declared for a generic query; no query takes it yet.
 
 ---
 
