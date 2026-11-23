@@ -1,45 +1,32 @@
-# Ledger — Distributed State Directory
+# ledger
 
-```
+ledger is a store of signed records for peer meshes: an append-only log of
+typed records (members, roles, reachability, latency, key operations, quorum
+membership, blob references), a directory cache that keeps the current view of
+those records per partition, pluggable persistence for both, and signed anchor
+snapshots so a new node can bootstrap from one file. It carries no network
+code; a gossip engine (whisper, through `whisper_adapter.go`) moves its records
+between peers.
+
+```sh
 go get github.com/bbmumford/ledger
 ```
 
-**Related:** [Aether](https://github.com/ORBTR/Aether) (wire protocol) · [Whisper](https://github.com/bbmumford/whisper) (gossip engine)
-
-> **Ledger** is an append-only, signed-record distributed state directory for peer meshes. It provides typed record storage, materialised caches, pluggable persistence backends (memory / SQLite / Turso), signed anchor snapshots for fast bootstrap, and a distributed blob storage pipeline with quota / pinning / replication / rarest-first fetch. Designed to ride on top of any wire transport — pairs naturally with [Aether](https://github.com/ORBTR/Aether) (Noise-UDP mesh protocol) and [Whisper](https://github.com/bbmumford/whisper) (directory gossip).
-
 ---
 
-## Status
+## What ledger is
 
-| Area | Status |
-|------|--------|
-| **Record schema + types** | Stable |
-| **DirectoryCache** (materialised views) | Stable |
-| **Pluggable CacheStore** (memory / SQLite / Turso) | Stable |
-| **Append-only ledger + subscriber broadcast** | Stable |
-| **Anchor snapshot + signing** | Stable |
-| **Distributed blob pipeline** (chunker, fetcher, replicator, rarest-first, endgame, pinning, quota, abuse, proof, resolver) | Stable |
-| **Whisper adapter** (Record → GossipPayload) | Stable |
-| **v0.0.1 release** | Shipped (2026-04-20) |
-
-In production use by the HSTLES mesh across `bootstrap.hstles.com`, `node.hstles.com`, and every ORBTR endpoint (`{devices,relay,app,get,help,node,orbtr}.orbtr.io`) — full fleet currently carries ~500 directory records per region with anchor snapshots rotating every 5 minutes.
-
----
-
-## What Ledger Is
-
-Ledger sits between a wire protocol (Aether) and applications:
+ledger sits between a transport and the applications that read mesh state:
 
 ```
-Application (HSTLES mesh, ORBTR agent, custom app)
+Application (a mesh node, a device agent, any app)
   ↓ queries records, applies mutations, subscribes to topic updates
 Ledger (state directory)
   ↓ serialises records as opaque gossip payload
 Aether + Whisper (transport + epidemic propagation)
 ```
 
-A transport moves bytes. Ledger gives those bytes meaning — typed records for peers, roles, reachability, latency, capabilities, and blob references. Whisper's gossip engine carries Ledger records between peers using delta sync, digest comparison, and per-peer watermarks.
+A transport moves bytes. ledger gives those bytes meaning — typed records for peers, roles, reachability, latency, capabilities, and blob references. whisper's gossip engine carries ledger records between peers using delta sync, digest comparison, and per-peer watermarks.
 
 ---
 
@@ -49,15 +36,15 @@ A transport moves bytes. Ledger gives those bytes meaning — typed records for 
 |-----------|------|-------------|
 | **Record types** | `types.go` | Record, Topic, MemberRecord, RoleRecord, ReachRecord, LatencyRecord, HandlerMetadata, KeyOpsRecord, QuorumRecord |
 | **Cache** | `cache/` | `DirectoryCache` — materialised view with per-topic queries (Members, Roles, Reach, Latency); CRDT semantics |
-| **CacheStore** | `cache/store.go`, `cache/store_memory.go` | Pluggable backend interface (memory built-in; SQLite/Turso via consumer) |
-| **Ledger** | `storage/ledger.go`, `storage/local.go`, `storage/memory.go` | Append-only record log with subscriber broadcast |
+| **CacheStore** | `cache/store.go`, `cache/store_memory.go` | the cache's backend interface; `NewMemoryCacheStore` is built in, and a consumer plugs in SQLite, Turso or any store that meets the contract |
+| **Ledger** | `storage/ledger.go`, `storage/local.go`, `storage/memory.go` | the append-only record log with streaming subscribers: `MemoryLedger`, and `LocalDBLedger` over any `database/sql` SQLite connection |
 | **Anchor** | `anchor/` | Signed snapshot of all records for fast bootstrap (`generator.go`, `crypto.go`, `types.go`) |
-| **Blob** | `blob/` + `blob/distributed/` | Content-addressed blob store + distributed pipeline: chunker, encryption, fetcher, advertiser, replicator, rarest-first, endgame, proof (on-chain + local), pinning, quota, abuse guard |
-| **Whisper adapter** | `whisper_adapter.go` | Implements Whisper's `GossipPayload` interface for Ledger records |
+| **Blob references** | `blob.go`, `blob/distributed/onchain/` | the `BlobStore` interfaces beside records; `blob/distributed` itself is an empty namespace (mesh blob storage lives in diststore), and `onchain` holds the proof-of-storage challenge and response, the paid-pinning envelopes and the `EscrowClient` that reports to the on-chain escrow |
+| **Whisper adapter** | `whisper_adapter.go` | makes the directory cache a whisper `StateStore`, so whisper's G1 exchange can drive it |
 | **Metrics** | `metrics.go` | Prometheus-compatible counters + gauges |
 | **ACL** | `acl.go` | Topic-level write authorisation |
 | **Compaction** | `compaction.go` | Tombstone + expiry compaction on the append log |
-| **Conflict** | `conflict.go` | Lamport-clock + sequence conflict resolution |
+| **Conflict log** | `conflict.go` | a per-topic ring buffer of recent merge conflicts (`DirectoryCache.SetConflictLogging`) |
 
 ---
 
@@ -73,7 +60,7 @@ type Record struct {
     Body            json.RawMessage // typed payload (MemberRecord, RoleRecord, etc.)
     Signature       []byte          // Ed25519 signature over the canonical encoding
     Timestamp       time.Time
-    LamportClock    uint64          // causal ordering
+    LamportClock    uint64          // signed; merges do not order by it
     HLCTimestamp    uint64          // hybrid logical clock (0 = unused)
     Tombstone       bool            // deletion marker
     DeletedAt       time.Time
@@ -102,8 +89,8 @@ type Record struct {
 
 1. **Append-only**. Every state change appends a new record; older records are tombstoned, never mutated in place. Which record a key keeps is decided by the topic's merge function (see Design).
 2. **Signed end-to-end**. Every record carries an Ed25519 signature by its `NodeID`. A peer can verify any record came from the claimed author.
-3. **CRDT-friendly**. Records converge deterministically given the same set of observations — ordering doesn't matter for eventual consistency, Lamport clock breaks ties for causally-dependent updates.
-4. **Transport-agnostic**. Ledger doesn't import any network code. The `whisper_adapter.go` provides `GossipPayload` serialisation; consumers wire Ledger to Whisper (or any other gossip engine) at the integration layer.
+3. **CRDT-friendly**. Records converge deterministically given the same set of observations, whatever order they arrive in; the topic's merge function decides which record a key keeps (see Design).
+4. **Transport-agnostic**. ledger imports no network code. `whisper_adapter.go` adapts the cache to whisper's `StateStore`; consumers wire Ledger to Whisper (or any other gossip engine) at the integration layer.
 5. **Pluggable persistence**. `CacheStore` is an interface with a memory-backed default; consumers plug in SQLite, Turso, or any KV store that satisfies the contract.
 6. **Partition isolation**. Every record carries a `Partition`. Queries scope to a partition; the empty string is the global scope. A deployment with several partitions never serves one partition's state to another.
 
@@ -167,8 +154,7 @@ history arrives in timestamp order (`LocalDBLedger`) or topic by topic in append
 records in the order concurrent appends broadcast them, so the highest sequence a consumer has seen can sit above a
 record it has not yet received. The per-topic `Seq` a ledger assigns is
 not gap-free either, since an append may give its own larger `Seq`. Restarting exactly needs a delivery position that
-grows in delivery order (for example the store's row order), which is a change to this package's contract that no
-design states yet.
+grows in delivery order (for example the store's row order), which would change this package's contract.
 
 ---
 
@@ -181,42 +167,93 @@ Generated API reference (pkgsite) for each tagged release is published to GitHub
 
 ---
 
-## Quick Start
+## Quick start
 
 ```go
 import (
-    "context"
-    "time"
+	"context"
+	"encoding/json"
+	"time"
 
-    "github.com/bbmumford/ledger"
-    "github.com/bbmumford/ledger/cache"
-    "github.com/bbmumford/ledger/storage"
+	"github.com/bbmumford/ledger"
+	"github.com/bbmumford/ledger/cache"
+	"github.com/bbmumford/ledger/storage"
 )
 
-// In-memory ledger + cache — no external dependencies.
 ctx := context.Background()
-log := storage.NewMemoryLedger()
-store := cache.NewMemoryStore()
-dc := cache.NewDirectoryCache(store)
-log.Subscribe(dc)
+log := storage.NewMemoryLedger(storage.MemoryLedgerConfig{MaxRecordsPerTopic: 10000})
+dc := cache.NewDirectoryCache() // memory-backed unless stores are passed
 
-// Append a member record.
-rec := &ledger.Record{
-    Topic:     ledger.TopicMember,
-    NodeID:    "vl1_abc123",
-    Timestamp: time.Now(),
-    Body:      /* encoded MemberRecord */,
+body, _ := json.Marshal(ledger.MemberRecord{Partition: "p1", NodeID: "vl1_abc123", CreatedAt: time.Now()})
+rec := ledger.Record{
+	Topic:     ledger.TopicMember,
+	Partition: "p1",
+	NodeID:    "vl1_abc123",
+	Timestamp: time.Now(),
+	Body:      body,
 }
-log.Append(ctx, rec)
+_ = log.Append(ctx, rec)
 
-// Query the materialised view.
-members, _ := dc.Members(ctx, "", cache.MemberQuery{Region: "syd"})
+// Keep the cache in step with the log: history first, then live records.
+ch, _ := log.Stream(ctx, nil, nil)
+go func() {
+	for r := range ch {
+		_ = dc.Apply(r)
+	}
+}()
+
+members, _ := dc.Members(ctx, "p1")
 ```
 
----
+| package | what it holds |
+|---|---|
+| `ledger` | `Record`, the record types, topics, signatures, `SigningLedger`, `StreamEnd`, ACL, compaction, expiry, metrics, the whisper adapter |
+| `ledger/cache` | `DirectoryCache` and `CacheStore` |
+| `ledger/storage` | `MemoryLedger` and `LocalDBLedger` |
+| `ledger/anchor` | signed anchor snapshots: generation, signing, verification |
+| `ledger/blob/distributed/onchain` | proof of storage and paid pinning for the on-chain escrow |
+| `ledger/pb` | the protobuf record messages |
 
-## License
+## Dependencies
 
-[MIT](LICENSE)
+- `github.com/bbmumford/whisper`: the `StateStore` and record-set types the
+  adapter implements.
+- `golang.org/x/crypto` (BLAKE2b, SHA-3) and `google.golang.org/protobuf`.
+- Tests only: `modernc.org/sqlite`, the pure-Go SQLite driver behind
+  `LocalDBLedger`'s tests.
 
-Copyright (c) 2026 HSTLES / ORBTR Pty Ltd
+## Used by
+
+Importers in the ORBTR estate:
+
+- `github.com/bbmumford/loom/node`, `directory`, `node/meshstatus` and
+  `core/directory/gossip` (with `anchor`, `cache`, `storage`): the platform
+  mesh's live directory.
+- `github.com/bbmumford/reach` (with `storage`): the reachability records it
+  publishes.
+- `github.com/bbmumford/mercury`, `github.com/bbmumford/minerva` and
+  `github.com/bbmumford/plutus` (`blob/distributed/onchain` among them).
+- `github.com/ORBTR/agent/internal/core/wire`, `internal/store` and
+  `systempart` (with `cache`): the device agent's directory.
+- `github.com/ORBTR/help.orbtr.io` (with `cache`),
+  `github.com/ORBTR/Library/domain/monitoringhost`,
+  `github.com/ORBTR/cortex/credential/api_key`,
+  `github.com/ORBTR/ai/compute.orbtr.ai` and
+  `github.com/ORBTR/tools/schemaref/manifest` (`storage`).
+
+## Platforms and build
+
+Pure Go, no cgo and no build tags. The module's `go` directive is 1.25.0.
+Releases are cut by release-please from conventional commits.
+
+## Licence
+
+MIT. Copyright (c) 2026 Brandon Miller-Mumford. The full text is in
+[LICENSE](LICENSE).
+
+## Contributing
+
+[AGENTS.md](AGENTS.md) holds the repository's two rules, for people and coding
+agents alike: no temporary documents in the repository, and conventional commit
+messages that stand on their own. [CLAUDE.md](CLAUDE.md) imports it for Claude
+Code.
