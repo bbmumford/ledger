@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -116,7 +117,7 @@ var addedRecordColumns = []struct{ name, definition string }{
 	{"deletedAtUnix", "deletedAtUnix INTEGER NOT NULL DEFAULT 0"},
 	{"tombstoneReason", "tombstoneReason TEXT NOT NULL DEFAULT ''"},
 	{"expiresAtUnix", "expiresAtUnix INTEGER NOT NULL DEFAULT 0"},
-	{"authorPubkey", "authorPubkey BLOB"},
+	{"authorPubKey", "authorPubKey BLOB"},
 	{"blobCid", "blobCid TEXT NOT NULL DEFAULT ''"},
 }
 
@@ -124,7 +125,11 @@ var addedRecordColumns = []struct{ name, definition string }{
 // lacks. NewLocalDBLedger runs it after CREATE TABLE IF NOT EXISTS, which leaves
 // an existing table as it is, so a LAD file whose ladRecords lacks them opens
 // with every column Append, BatchAppend, Stream and Snapshot name. A row stored
-// without them reads back with no author key, no tombstone and zero clocks.
+// without them reads back with no author key, no tombstone and zero clocks. A
+// column is matched by name without case, as SQLite matches column names: a file
+// whose table spells a column in another case (authorPubkey for authorPubKey)
+// already holds it, and adding it again would fail the open with a duplicate
+// column.
 func addRecordColumns(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(ladRecords)`)
 	if err != nil {
@@ -143,7 +148,7 @@ func addRecordColumns(ctx context.Context, db *sql.DB) error {
 			_ = rows.Close()
 			return fmt.Errorf("lad: read ladRecords columns: %w", err)
 		}
-		have[name] = true
+		have[strings.ToLower(name)] = true
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -153,7 +158,7 @@ func addRecordColumns(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("lad: read ladRecords columns: %w", err)
 	}
 	for _, c := range addedRecordColumns {
-		if have[c.name] {
+		if have[strings.ToLower(c.name)] {
 			continue
 		}
 		if _, err := db.ExecContext(ctx, `ALTER TABLE ladRecords ADD COLUMN `+c.definition); err != nil {
@@ -167,7 +172,7 @@ func addRecordColumns(ctx context.Context, db *sql.DB) error {
 // them and scanRecord reads them.
 const recordColumns = `topic, seq, partitionId, nodeId, body, signature, timestamp,
 	lamportClock, hlcTimestamp, tombstone, deletedAtUnix, tombstoneReason, expiresAtUnix,
-	authorPubkey, blobCid`
+	authorPubKey, blobCid`
 
 // insertRecord is the INSERT Append and BatchAppend store a record with.
 const insertRecord = `INSERT INTO ladRecords (` + recordColumns + `)
@@ -276,7 +281,7 @@ func NewLocalDBLedger(db *sql.DB, cfg LedgerConfig) (*LocalDBLedger, error) {
 			deletedAtUnix INTEGER NOT NULL DEFAULT 0,
 			tombstoneReason TEXT NOT NULL DEFAULT '',
 			expiresAtUnix INTEGER NOT NULL DEFAULT 0,
-			authorPubkey BLOB,
+			authorPubKey BLOB,
 			blobCid TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (topic, seq)
 		);

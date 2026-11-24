@@ -53,7 +53,7 @@ type Record struct {
 	DeletedAt       time.Time       `json:"deletedAt,omitempty"`
 	TombstoneReason string          `json:"tombstoneReason,omitempty"` // "explicit", "cap"
 	ExpiresAt       time.Time       `json:"expiresAt,omitempty"`       // TTL expiration (zero = never)
-	AuthorPubKey    []byte          `json:"authorPubkey,omitempty"`    // Ed25519 public key of record author
+	AuthorPubKey    []byte          `json:"authorPubKey,omitempty"`    // Ed25519 public key of record author
 	BlobCID         string          `json:"blobCid,omitempty"`         // content-addressed blob reference
 }
 
