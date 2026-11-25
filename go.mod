@@ -1,6 +1,6 @@
 module github.com/bbmumford/ledger
 
-go 1.25.0
+go 1.27.4
 
 require (
 	github.com/bbmumford/whisper v0.0.19
