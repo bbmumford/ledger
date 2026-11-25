@@ -39,7 +39,7 @@ A transport moves bytes. ledger gives those bytes meaning — typed records for 
 | **CacheStore** | `cache/store.go`, `cache/store_memory.go` | the cache's backend interface; `NewMemoryCacheStore` is built in, and a consumer plugs in SQLite, Turso or any store that meets the contract |
 | **Ledger** | `storage/ledger.go`, `storage/local.go`, `storage/memory.go` | the append-only record log with streaming subscribers: `MemoryLedger`, and `LocalDBLedger` over any `database/sql` SQLite connection |
 | **Anchor** | `anchor/` | Signed snapshot of all records for fast bootstrap (`generator.go`, `crypto.go`, `types.go`) |
-| **Blob references** | `blob.go`, `blob/distributed/onchain/` | the `BlobStore` interfaces beside records; `blob/distributed` itself is an empty namespace (mesh blob storage lives in diststore), and `onchain` holds the proof-of-storage challenge and response, the paid-pinning envelopes and the `EscrowClient` that reports to the on-chain escrow |
+| **Blob references** | `blob.go` | the `BlobStore` interfaces beside records; mesh blob storage, proof of storage and paid pinning live in `github.com/bbmumford/diststore` |
 | **Whisper adapter** | `whisper_adapter.go` | makes the directory cache a whisper `StateStore`, so whisper's G1 exchange can drive it |
 | **Metrics** | `metrics.go` | Prometheus-compatible counters + gauges |
 | **ACL** | `acl.go` | Topic-level write authorisation |
@@ -211,14 +211,13 @@ members, _ := dc.Members(ctx, "p1")
 | `ledger/cache` | `DirectoryCache` and `CacheStore` |
 | `ledger/storage` | `MemoryLedger` and `LocalDBLedger` |
 | `ledger/anchor` | signed anchor snapshots: generation, signing, verification |
-| `ledger/blob/distributed/onchain` | proof of storage and paid pinning for the on-chain escrow |
 | `ledger/pb` | the protobuf record messages |
 
 ## Dependencies
 
 - `github.com/bbmumford/whisper`: the `StateStore` and record-set types the
   adapter implements.
-- `golang.org/x/crypto` (BLAKE2b, SHA-3) and `google.golang.org/protobuf`.
+- `google.golang.org/protobuf`.
 - Tests only: `modernc.org/sqlite`, the pure-Go SQLite driver behind
   `LocalDBLedger`'s tests.
 
@@ -232,7 +231,7 @@ Importers in the ORBTR estate:
 - `github.com/bbmumford/reach` (with `storage`): the reachability records it
   publishes.
 - `github.com/bbmumford/mercury`, `github.com/bbmumford/minerva` and
-  `github.com/bbmumford/plutus` (`blob/distributed/onchain` among them).
+  `github.com/bbmumford/plutus`.
 - `github.com/ORBTR/agent/internal/core/wire`, `internal/store` and
   `systempart` (with `cache`): the device agent's directory.
 - `github.com/ORBTR/help.orbtr.io` (with `cache`),
