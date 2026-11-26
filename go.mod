@@ -3,7 +3,7 @@ module github.com/bbmumford/ledger
 go 1.27.4
 
 require (
-	github.com/bbmumford/whisper v0.0.19
+	github.com/bbmumford/whisper v0.0.20
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.53.0
 )
